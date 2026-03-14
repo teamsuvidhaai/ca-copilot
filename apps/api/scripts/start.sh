@@ -10,7 +10,7 @@ alembic upgrade head || echo "⚠️  Alembic exited with non-zero — continuin
 
 # 2. Seed basic data (Kits)
 echo "🌱 Seeding initial kits..."
-python scripts/seed_data.py
+python scripts/seed_data.py || echo "⚠️  Seeding skipped — data likely already exists"
 
 # 3. Start Background Worker (Free Tier Optimization)
 echo "👷 Starting Background Worker..."
