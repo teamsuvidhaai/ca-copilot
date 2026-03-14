@@ -29,6 +29,7 @@ google-auth-oauthlib
 openpyxl
 xlsxwriter
 fuzzywuzzy
+thefuzz
 python-levenshtein
 requests
 pytesseract
