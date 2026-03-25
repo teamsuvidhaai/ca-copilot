@@ -212,6 +212,27 @@ class GetInvoice(Base):
     file_path = Column(String(1000), nullable=True) # Storage path or URL to the original document
     received_at = Column(DateTime, server_default=sa.text('CURRENT_TIMESTAMP'))
     synced_to_tally = Column(Boolean, default=False)
+    status = Column(String(50), default="pending")  # pending, approved
+    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True)
+
+    line_items = relationship("InvoiceLineItem", back_populates="invoice", cascade="all, delete-orphan")
+
+
+class InvoiceLineItem(Base):
+    """Line items extracted by OCR for a given invoice.
+    n8n writes directly to this table after processing."""
+    __tablename__ = "get_invoice_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    invoice_id = Column(Integer, ForeignKey("get_invoice.id", ondelete="CASCADE"), nullable=False, index=True)
+    description = Column(String(500), nullable=False)
+    service_code = Column(String(100), nullable=True)   # HSN / SAC code
+    quantity = Column(String(50), default="1")
+    price = Column(String(50), nullable=True)           # unit price
+    amount = Column(String(50), nullable=True)          # line total
+
+    invoice = relationship("GetInvoice", back_populates="line_items")
+
 
 class AccountingVoucher(Base):
     __tablename__ = "accounting_vouchers"
@@ -309,6 +330,11 @@ class Voucher(Base):
                            primaryjoin="Voucher.guid == foreign(VoucherEntry.voucher_guid)",
                            cascade="all, delete-orphan")
 
+    inventory_entries = relationship("VoucherInventoryEntry", back_populates="voucher",
+                                     foreign_keys="VoucherInventoryEntry.voucher_guid",
+                                     primaryjoin="Voucher.guid == foreign(VoucherInventoryEntry.voucher_guid)",
+                                     cascade="all, delete-orphan")
+
     __table_args__ = (
         sa.UniqueConstraint('company_name', 'guid', name='uq_vouchers_company_guid'),
         Index('idx_vouchers_date', 'company_name', 'date'),
@@ -344,6 +370,44 @@ class VoucherEntry(Base):
                             name='uq_ventry_company_guid_ledger_amount'),
         Index('idx_ventry_ledger', 'company_name', 'ledger_name'),
         Index('idx_ventry_date', 'company_name', 'voucher_date'),
+    )
+
+
+class VoucherInventoryEntry(Base):
+    """Individual stock item lines from ALLINVENTORYENTRIES.LIST.
+    A Purchase voucher for 2 items produces 2 rows:
+      Laptop Dell 15   qty=1   rate=50000   amount=50000   hsn=84713010
+      Mouse Logitech   qty=5   rate=500     amount=2500    hsn=84716060"""
+    __tablename__ = "voucher_inventory_entries"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_name = Column(Text, nullable=False, index=True)
+    voucher_guid = Column(Text, nullable=False, index=True)  # links to vouchers.guid
+    voucher_date = Column(Text, nullable=True)               # denormalised for fast date filtering
+    voucher_type = Column(Text, nullable=True)               # denormalised for fast type filtering
+    stock_item_name = Column(Text, nullable=False)           # Tally stock item name
+    quantity = Column(sa.Numeric, nullable=True)             # qty sold/purchased
+    rate = Column(sa.Numeric, nullable=True)                 # per-unit rate
+    amount = Column(sa.Numeric, nullable=True)               # line total (qty × rate)
+    uom = Column(Text, nullable=True)                        # unit of measure: Nos, Kg, Pcs, Ltr
+    hsn_code = Column(Text, nullable=True)                   # HSN/SAC code
+    gst_rate = Column(sa.Numeric, nullable=True)             # applicable GST rate %
+    godown = Column(Text, nullable=True)                     # godown/warehouse name
+    batch = Column(Text, nullable=True)                      # batch number
+    discount = Column(sa.Numeric, nullable=True)             # discount amount/percentage
+    synced_at = Column(DateTime(timezone=True), server_default=sa.func.now())
+
+    voucher = relationship("Voucher", back_populates="inventory_entries",
+                           foreign_keys=[voucher_guid],
+                           primaryjoin="VoucherInventoryEntry.voucher_guid == Voucher.guid")
+
+    __table_args__ = (
+        sa.UniqueConstraint('company_name', 'voucher_guid', 'stock_item_name', 'quantity', 'amount',
+                            name='uq_vinv_company_guid_item_qty_amount'),
+        Index('idx_vinv_item', 'company_name', 'stock_item_name'),
+        Index('idx_vinv_date', 'company_name', 'voucher_date'),
+        Index('idx_vinv_hsn', 'company_name', 'hsn_code'),
+        Index('idx_vinv_godown', 'company_name', 'godown'),
     )
 
 

@@ -7,7 +7,7 @@ from app.schemas.service import Service
 
 class ClientBase(BaseModel):
     name: str
-    email: str
+    email: Optional[str] = None
     gstins: Optional[List[str]] = []
     pan: Optional[str] = None
     cin: Optional[str] = None

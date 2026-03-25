@@ -310,6 +310,88 @@ async def run_gstr1_vs_3b(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/gstr2b-vs-3b")
+async def run_gstr2b_vs_3b(
+    file1: UploadFile = File(...),
+    file2: UploadFile = File(...),
+    client_id: str = Form(None),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+) -> Any:
+    """
+    GSTR-2B vs GSTR-3B — Summary-level ITC reconciliation.
+
+    file1: GSTR-2B (.xlsx, .csv, .json, .pdf)
+    file2: GSTR-3B (.xlsx, .csv, .json, .pdf)
+
+    Returns ITC variance per component, risk assessment, and recommended actions.
+    """
+    try:
+        from app.services.gst.gstr2b_vs_3b import reconcile_gstr2b_vs_3b
+
+        bytes1 = await file1.read()
+        bytes2 = await file2.read()
+        fn1 = file1.filename or "gstr2b.xlsx"
+        fn2 = file2.filename or "gstr3b.xlsx"
+
+        result = reconcile_gstr2b_vs_3b([bytes1, bytes2], [fn1, fn2])
+
+        # Save Excel report
+        report_bytes = result.pop('report_bytes')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        client_folder = client_id if client_id else "General"
+        output_key = f"Reports/{current_user.firm_id}/{client_folder}/GSTR2B-VS-3B_{timestamp}.xlsx"
+
+        storage_service.upload_file(
+            report_bytes, output_key,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        # Create job record
+        from sqlalchemy.future import select
+        from sqlalchemy.orm import selectinload
+
+        job = Job(
+            job_type="gstr2b_vs_3b",
+            input_files=[fn1, fn2],
+            output_files=[output_key],
+            status=JobStatus.COMPLETED,
+            created_by=current_user.id,
+            firm_id=current_user.firm_id,
+            client_id=client_id if client_id else None,
+        )
+
+        # Auto-save to Client Drive
+        drive_fid = await save_report_to_drive_async(
+            db=db,
+            firm_id=current_user.firm_id,
+            client_id=client_id if client_id else None,
+            job_type="gstr2b_vs_3b",
+            output_file_bytes=report_bytes,
+            output_key=output_key,
+        )
+        if drive_fid:
+            job.drive_file_id = drive_fid
+
+        db.add(job)
+        await db.commit()
+
+        db_result = await db.execute(
+            select(Job).options(selectinload(Job.events)).filter(Job.id == job.id)
+        )
+        job = db_result.scalars().first()
+
+        return JSONResponse(content={
+            "success": True,
+            "job_id": str(job.id),
+            **result,
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/calculate-refund")
 async def calculate_gst_refund(
     request_data: dict,
