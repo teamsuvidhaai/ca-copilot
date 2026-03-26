@@ -462,3 +462,60 @@ class DriveFile(Base):
         Index('idx_drive_file_client', 'client_id', 'firm_id'),
     )
 
+
+# ═══════════════════════════════════════════════════════
+# Banking — Bank statement upload + transaction extraction
+# ═══════════════════════════════════════════════════════
+
+class BankStatement(Base):
+    """One row per uploaded bank statement PDF."""
+    __tablename__ = "bank_statements"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    bank_name = Column(String(200), nullable=True)
+    account_number = Column(String(50), nullable=True)          # masked in display
+    statement_period_start = Column(sa.Date, nullable=True)
+    statement_period_end = Column(sa.Date, nullable=True)
+    opening_balance = Column(sa.Numeric(15, 2), nullable=True)
+    closing_balance = Column(sa.Numeric(15, 2), nullable=True)
+    total_credits = Column(sa.Numeric(15, 2), nullable=True)
+    total_debits = Column(sa.Numeric(15, 2), nullable=True)
+    transaction_count = Column(Integer, default=0)
+    file_path = Column(Text, nullable=True)                     # Supabase storage path
+    original_filename = Column(String(500), nullable=True)
+    status = Column(String(20), default="processing")           # processing | completed | failed
+    error_message = Column(Text, nullable=True)
+    raw_text = Column(Text, nullable=True)                      # LlamaParse extracted text
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    transactions = relationship("BankTransaction", back_populates="statement", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index('idx_bank_stmt_client', 'client_id'),
+    )
+
+
+class BankTransaction(Base):
+    """Individual transaction lines extracted from a bank statement."""
+    __tablename__ = "bank_transactions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    statement_id = Column(UUID(as_uuid=True), ForeignKey("bank_statements.id", ondelete="CASCADE"), nullable=False, index=True)
+    transaction_date = Column(sa.Date, nullable=True)
+    value_date = Column(sa.Date, nullable=True)
+    description = Column(Text, nullable=True)
+    reference_no = Column(String(100), nullable=True)           # Cheque/UTR/Ref
+    debit = Column(sa.Numeric(15, 2), nullable=True)
+    credit = Column(sa.Numeric(15, 2), nullable=True)
+    balance = Column(sa.Numeric(15, 2), nullable=True)
+    category = Column(String(50), nullable=True)                # Salary, Rent, GST, etc.
+    party_name = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    statement = relationship("BankStatement", back_populates="transactions")
+
+    __table_args__ = (
+        Index('idx_bank_txn_stmt', 'statement_id'),
+    )

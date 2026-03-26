@@ -239,7 +239,7 @@ async def update_invoice(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """
-    Update an invoice (specifically expenses_type).
+    Update an invoice.
     """
     query = select(GetInvoice).where(GetInvoice.id == id)
     result = await db.execute(query)
@@ -248,11 +248,23 @@ async def update_invoice(
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     update_data = invoice_in.model_dump(exclude_unset=True)
+
+    # Strip timezone from invoice_date — DB column is TIMESTAMP WITHOUT TIME ZONE
+    if 'invoice_date' in update_data and update_data['invoice_date'] is not None:
+        dt = update_data['invoice_date']
+        if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+            update_data['invoice_date'] = dt.replace(tzinfo=None)
+
     for field, value in update_data.items():
         setattr(invoice, field, value)
 
-    await db.commit()
-    await db.refresh(invoice)
+    try:
+        await db.commit()
+        await db.refresh(invoice)
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
     return invoice
 
 

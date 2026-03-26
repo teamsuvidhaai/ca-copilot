@@ -34,3 +34,4 @@ python-levenshtein
 requests
 pytesseract
 python-docx
+llama_cloud

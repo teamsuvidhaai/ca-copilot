@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # GST Services
     APPYFLOW_API_KEY: Optional[str] = None
 
+    # LlamaParse (document parsing)
+    LLAMA_CLOUD_API_KEY: Optional[str] = None
+
 
     BACKEND_CORS_ORIGINS: List[str] = []
 

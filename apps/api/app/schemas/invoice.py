@@ -4,16 +4,16 @@ from uuid import UUID
 from pydantic import BaseModel
 
 class InvoiceBase(BaseModel):
-    vendor_name: str
+    vendor_name: Optional[str] = None
     gst_number: Optional[str] = None
-    invoice_number: str
-    invoice_date: datetime
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[datetime] = None
     currency: Optional[str] = "INR"
     amount: Optional[str] = None
     gst_amount: Optional[str] = None
     total_amount: Optional[str] = None
     expenses_type: Optional[str] = None
-    source: str
+    source: Optional[str] = None
     client_email_id: Optional[str] = None
     file_path: Optional[str] = None
     synced_to_tally: Optional[bool] = False

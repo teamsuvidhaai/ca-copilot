@@ -430,3 +430,83 @@ async def calculate_gst_refund(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/calculate-refund-from-files")
+async def calculate_refund_from_files(
+    refund_type: str = Form(...),
+    period: str = Form(None),
+    files: list[UploadFile] = File(...),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """
+    GST Refund Calculator — file-based.
+
+    Accepts uploaded GSTR-3B, GSTR-1, Purchase Register, etc.
+    Extracts relevant values using AI parsing, then computes the refund.
+
+    Returns the same result as /calculate-refund plus extraction metadata.
+    """
+    try:
+        from app.services.gst.refund_file_extractor import extract_refund_values
+        from app.services.gst.refund_calculator import calculate_refund
+
+        if not refund_type:
+            raise HTTPException(status_code=400, detail="refund_type is required")
+
+        if not files or len(files) == 0:
+            raise HTTPException(status_code=400, detail="At least one file is required")
+
+        if len(files) > 5:
+            raise HTTPException(status_code=400, detail="Maximum 5 files allowed")
+
+        # Read all files
+        file_bytes_list = []
+        filenames = []
+        for f in files:
+            content = await f.read()
+            if len(content) > 10 * 1024 * 1024:  # 10MB limit per file
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File '{f.filename}' exceeds 10MB limit"
+                )
+            file_bytes_list.append(content)
+            filenames.append(f.filename or "unknown.xlsx")
+
+        logger.info(f"Refund file calc: type={refund_type}, files={filenames}")
+
+        # Extract values from files
+        extracted_data = extract_refund_values(file_bytes_list, filenames, refund_type)
+
+        # Pull out metadata before passing to calculator
+        extraction_notes = extracted_data.pop("_extraction_notes", [])
+        file_types_found = extracted_data.pop("_file_types_found", [])
+
+        # Calculate refund using extracted values
+        result = calculate_refund(extracted_data)
+
+        if result.get("error"):
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        # Add extraction metadata to result
+        result["extraction"] = {
+            "files_processed": filenames,
+            "file_types_detected": file_types_found,
+            "notes": extraction_notes,
+            "extracted_values": {
+                k: v for k, v in extracted_data.items()
+                if k != "refund_type" and isinstance(v, (int, float))
+            },
+        }
+
+        logger.info(
+            f"Refund file calc: type={refund_type}, "
+            f"files={file_types_found}, result=₹{result['max_refund']:,.2f}"
+        )
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

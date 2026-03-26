@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.endpoints import auth, clients, kits, documents, conversations, services, jobs, tools, agreements, hsn_lookup, invoices, vouchers, tally, reconciliation, drive, compliance_calendar
+from app.api.endpoints import auth, clients, kits, documents, conversations, services, jobs, tools, agreements, hsn_lookup, invoices, vouchers, tally, reconciliation, drive, compliance_calendar, bank_statements
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
@@ -19,4 +19,5 @@ api_router.include_router(tally.router, prefix="/tally", tags=["tally"])
 api_router.include_router(reconciliation.router, prefix="/reconciliation", tags=["reconciliation"])
 api_router.include_router(drive.router, prefix="/drive", tags=["drive"])
 api_router.include_router(compliance_calendar.router, prefix="/compliance-calendar", tags=["compliance-calendar"])
+api_router.include_router(bank_statements.router, prefix="/bank-statements", tags=["bank-statements"])
 
