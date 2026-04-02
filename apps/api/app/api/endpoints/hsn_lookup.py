@@ -71,6 +71,7 @@ class HSNMatch(BaseModel):
     description: str
     type: str  # HSN or SAC
     score: int  # match score 0-100
+    gst_rate: str = ""  # e.g. "5%", "12%", "18%", "28%"
 
 
 class SingleLookupRequest(BaseModel):
@@ -87,20 +88,108 @@ class BulkItem(BaseModel):
     score: Optional[int] = None
 
 
-# ─── Search Function ───
-def search_hsn(query: str, data: List[dict], limit: int = 10, min_score: int = 40) -> List[dict]:
+def _get_gst_rate(code: str, item_type: str) -> str:
+    """Get approximate GST rate based on HSN chapter/SAC code."""
+    if item_type == "SAC":
+        # Most services are 18%
+        c = code[:4] if len(code) >= 4 else code
+        sac_rates = {
+            "9954": "18%", "9961": "18%", "9962": "18%", "9963": "18%",
+            "9964": "5%/12%", "9965": "5%/12%", "9966": "5%/12%/18%",
+            "9967": "18%", "9968": "18%", "9969": "18%", "9971": "18%",
+            "9972": "18%", "9973": "18%", "9981": "18%", "9982": "18%",
+            "9983": "18%", "9984": "18%", "9985": "18%", "9986": "18%",
+            "9987": "18%", "9988": "18%", "9989": "18%", "9991": "Nil",
+            "9992": "Nil/18%", "9993": "Nil", "9994": "18%", "9995": "18%",
+            "9996": "18%", "9997": "18%",
+        }
+        return sac_rates.get(c, "18%")
+    # HSN goods
+    ch = code[:2] if len(code) >= 2 else code
+    try:
+        chapter = int(ch)
+    except ValueError:
+        return ""
+    # Nil / Exempt
+    if chapter in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+        return "Nil/5%"
+    # 5% slab
+    if chapter in (11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23):
+        return "5%/12%"
+    # 12% slab
+    if chapter in (24,):
+        return "28%"
+    if chapter in (25, 26, 27):
+        return "5%/18%"
+    if chapter in (28, 29, 30, 31, 32, 33):
+        return "5%/12%/18%"
+    if chapter in (34, 35, 36, 37, 38):
+        return "18%/28%"
+    if chapter in (39, 40):
+        return "18%"
+    if chapter in (41, 42, 43):
+        return "5%/12%/18%"
+    if chapter in (44, 45, 46, 47, 48, 49):
+        return "12%/18%"
+    if chapter in (50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63):
+        return "5%/12%"
+    if chapter in (64, 65, 66, 67):
+        return "18%"
+    if chapter in (68, 69, 70):
+        return "18%/28%"
+    if chapter in (71,):
+        return "3%"
+    if chapter in (72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83):
+        return "18%"
+    if chapter in (84, 85):
+        return "18%/28%"
+    if chapter in (86, 87, 88, 89):
+        return "18%/28%"
+    if chapter in (90, 91, 92, 93, 94, 95, 96):
+        return "18%/28%"
+    return "18%"
+
+
+def search_hsn(query: str, data: List[dict], limit: int = 10, min_score: int = 30) -> List[dict]:
     """Fuzzy search HSN/SAC by description."""
     query_upper = query.upper().strip()
 
     # Exact code match first
     for item in data:
         if item["code"] == query_upper:
-            return [{"code": item["code"], "description": item["description"], "type": item["type"], "score": 100}]
+            return [{"code": item["code"], "description": item["description"], "type": item["type"], "score": 100, "gst_rate": _get_gst_rate(item["code"], item["type"])}]
+
+    # Prefix code match (e.g. "85" shows all chapter 85 items)
+    if query_upper.isdigit() and len(query_upper) <= 4:
+        prefix_matches = []
+        for item in data:
+            if item["code"].startswith(query_upper):
+                prefix_matches.append({
+                    "code": item["code"],
+                    "description": item["description"],
+                    "type": item["type"],
+                    "score": 95 if item["code"] == query_upper else 90 - len(item["code"]),
+                    "gst_rate": _get_gst_rate(item["code"], item["type"]),
+                })
+        if prefix_matches:
+            prefix_matches.sort(key=lambda x: (-x["score"], len(x["code"])))
+            return prefix_matches[:limit]
+
+    # Substring match (fast, runs before fuzzy)
+    substring_matches = []
+    for item in data:
+        if query_upper in item["description"].upper():
+            substring_matches.append({
+                "code": item["code"],
+                "description": item["description"],
+                "type": item["type"],
+                "score": 85,
+                "gst_rate": _get_gst_rate(item["code"], item["type"]),
+            })
 
     # Fuzzy description matching
     scored = []
     for item in data:
-        # Use token_set_ratio for best matching with partial/reordered tokens
         score = fuzz.token_set_ratio(query_upper, item["description"].upper())
         if score >= min_score:
             scored.append({
@@ -108,11 +197,19 @@ def search_hsn(query: str, data: List[dict], limit: int = 10, min_score: int = 4
                 "description": item["description"],
                 "type": item["type"],
                 "score": score,
+                "gst_rate": _get_gst_rate(item["code"], item["type"]),
             })
 
-    # Sort by score descending, then by code length (shorter = more general category)
-    scored.sort(key=lambda x: (-x["score"], len(x["code"])))
-    return scored[:limit]
+    # Merge: substring first (deduplicated), then fuzzy
+    seen = set()
+    merged = []
+    for m in substring_matches + scored:
+        if m["code"] not in seen:
+            seen.add(m["code"])
+            merged.append(m)
+
+    merged.sort(key=lambda x: (-x["score"], len(x["code"])))
+    return merged[:limit]
 
 
 # ─── Endpoints ───

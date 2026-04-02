@@ -1,5 +1,8 @@
 from typing import Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from uuid import UUID as PyUUID
+import asyncio
+import logging
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -8,7 +11,157 @@ from app.api import deps
 from app.models.models import GetInvoice, InvoiceLineItem, User
 from app.schemas import invoice as invoice_schemas
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+# ═══ UPLOAD & AI PROCESSING ═══
+
+async def _process_invoice_background(
+    file_bytes: bytes,
+    filename: str,
+    client_id: str,
+    voucher_type: str,
+    content_type: str,
+):
+    """Background task: parse invoice and insert into DB."""
+    from app.db.session import AsyncSessionLocal
+    from app.services.invoice_parser import extract_invoice_data
+    from app.services.storage import storage_service
+    from datetime import datetime
+
+    try:
+        # 1. Extract structured data
+        data = await extract_invoice_data(file_bytes, filename, voucher_type)
+
+        # 2. Store file in Supabase (invoices bucket)
+        safe_name = filename.replace(" ", "_").replace("/", "_")
+        object_path = f"{client_id}/{safe_name}"
+        stored_path = None
+        try:
+            from supabase import create_client
+            from app.core.config import settings
+            supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+            # Ensure bucket exists
+            try:
+                supabase.storage.create_bucket("invoices", options={"public": False})
+            except Exception:
+                pass
+            supabase.storage.from_("invoices").upload(
+                path=object_path,
+                file=file_bytes,
+                file_options={"content-type": content_type or "application/pdf", "upsert": "true"}
+            )
+            stored_path = f"invoices/{object_path}"
+            logger.info(f"📁 File uploaded to Supabase: {stored_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ Supabase upload failed, using local: {e}")
+            from app.services.storage import storage_service
+            local_path = f"invoices/{client_id}/{safe_name}"
+            storage_service.upload_file(file_content=file_bytes, path=local_path, content_type=content_type or "application/pdf")
+            stored_path = local_path
+
+        # 3. Insert invoice into DB
+        async with AsyncSessionLocal() as db:
+            invoice = GetInvoice(
+                vendor_name=data.get("vendor_name", "Unknown"),
+                gst_number=data.get("gst_number"),
+                invoice_number=data.get("invoice_number", "N/A"),
+                invoice_date=_parse_date(data.get("invoice_date")),
+                currency=data.get("currency", "INR"),
+                amount=str(data.get("amount", "0") or "0"),
+                gst_amount=str(data.get("gst_amount", "0") or "0"),
+                total_amount=str(data.get("total_amount", "0") or "0"),
+                expenses_type=voucher_type if voucher_type else data.get("expenses_type", "Uncategorized"),
+                source="web",
+                file_path=stored_path or file_path,
+                synced_to_tally=False,
+                status="pending",
+                client_id=PyUUID(client_id) if client_id else None,
+            )
+            db.add(invoice)
+            await db.flush()  # Get the ID
+
+            # 4. Insert line items
+            for item in data.get("line_items", []):
+                line = InvoiceLineItem(
+                    invoice_id=invoice.id,
+                    description=item.get("description", "Item"),
+                    service_code=item.get("hsn_sac", ""),
+                    quantity=str(item.get("quantity", "1")),
+                    price=str(item.get("unit_price", "0") or "0"),
+                    amount=str(item.get("amount", "0") or "0"),
+                )
+                db.add(line)
+
+            await db.commit()
+            logger.info(f"✅ Invoice saved: ID={invoice.id}, "
+                        f"Vendor={invoice.vendor_name}, "
+                        f"Total={invoice.total_amount}, "
+                        f"Items={len(data.get('line_items', []))}")
+
+    except Exception as e:
+        logger.error(f"❌ Invoice processing failed for {filename}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def _parse_date(val):
+    """Parse date string safely."""
+    if not val:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.strptime(str(val), "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+@router.post("/upload")
+async def upload_invoice(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    client_id: str = Form(""),
+    clientId: str = Form(""),  # frontend sends both
+    voucher_type: str = Form(""),
+    vendor_name_preference: str = Form(""),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """
+    Upload an invoice file for AI processing.
+    Replaces the n8n webhook pipeline.
+    """
+    # Accept either client_id or clientId
+    cid = client_id or clientId
+    if not cid:
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    file_bytes = await file.read()
+    if len(file_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    if len(file_bytes) > 20 * 1024 * 1024:  # 20MB limit
+        raise HTTPException(status_code=413, detail="File too large (max 20MB)")
+
+    logger.info(f"📤 Invoice upload: {file.filename} ({len(file_bytes)} bytes) "
+                f"| client={cid} | type={voucher_type}")
+
+    # Process in background so upload returns immediately
+    background_tasks.add_task(
+        _process_invoice_background,
+        file_bytes=file_bytes,
+        filename=file.filename,
+        client_id=cid,
+        voucher_type=voucher_type,
+        content_type=file.content_type,
+    )
+
+    return {
+        "status": "processing",
+        "message": f"Invoice {file.filename} is being processed by AI. It will appear in your transactions within 30-60 seconds.",
+        "filename": file.filename,
+    }
 
 @router.get("/", response_model=List[invoice_schemas.Invoice])
 async def read_invoices(
@@ -339,12 +492,12 @@ async def get_invoice_file(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """
-    Proxy the actual file content from Supabase storage.
-    This avoids CORS issues by serving the file through our backend.
+    Serve the invoice file. Supports both local storage and Supabase.
     """
     from app.core.config import settings
-    from urllib.parse import quote
-    import requests as http_requests
+    from app.services.storage import storage_service
+    from fastapi.responses import FileResponse
+    import os
 
     query = select(GetInvoice).where(GetInvoice.id == id)
     result = await db.execute(query)
@@ -355,8 +508,40 @@ async def get_invoice_file(
     if not invoice.file_path:
         raise HTTPException(status_code=404, detail="No file associated")
 
+    # Determine content type from extension
+    ext = invoice.file_path.rsplit('.', 1)[-1].lower() if '.' in invoice.file_path else ''
+    content_type_map = {
+        'pdf': 'application/pdf',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'gif': 'image/gif',
+        'webp': 'image/webp',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'xls': 'application/vnd.ms-excel',
+        'csv': 'text/csv',
+    }
+    ct = content_type_map.get(ext, 'application/octet-stream')
+
+    # Try local storage first
+    if hasattr(storage_service, 'provider') and storage_service.provider == 'local':
+        local_path = storage_service.download_to_temp(invoice.file_path)
+        if local_path and os.path.exists(local_path):
+            return FileResponse(
+                local_path,
+                media_type=ct,
+                headers={"Content-Disposition": f'inline; filename="{os.path.basename(invoice.file_path)}"'},
+            )
+
+    # Fallback: try Supabase storage proxy
+    from urllib.parse import quote
+    import requests as http_requests
+
     supabase_url = settings.SUPABASE_URL
     supabase_key = settings.SUPABASE_KEY
+
+    if not supabase_url or not supabase_key:
+        raise HTTPException(status_code=404, detail="File not found (storage not configured)")
 
     parts = invoice.file_path.split("/", 1)
     if len(parts) < 2:
@@ -388,23 +573,9 @@ async def get_invoice_file(
     if file_resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Could not fetch file")
 
-    # Determine content type from extension
-    ext = object_path.rsplit('.', 1)[-1].lower() if '.' in object_path else ''
-    content_type_map = {
-        'pdf': 'application/pdf',
-        'jpg': 'image/jpeg',
-        'jpeg': 'image/jpeg',
-        'png': 'image/png',
-        'gif': 'image/gif',
-        'webp': 'image/webp',
-        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'xls': 'application/vnd.ms-excel',
-        'csv': 'text/csv',
-    }
-    ct = content_type_map.get(ext, 'application/octet-stream')
-
     return Response(
         content=file_resp.content,
         media_type=ct,
-        headers={"Content-Disposition": f"inline; filename=\"{object_path}\""},
+        headers={"Content-Disposition": f'inline; filename="{object_path}"'},
     )
+

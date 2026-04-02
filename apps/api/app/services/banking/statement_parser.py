@@ -6,6 +6,7 @@ Pipeline:  PDF → LlamaParse (text extraction) → OpenAI GPT-4o (JSON structur
 
 import json
 import logging
+import re
 import tempfile
 from datetime import date, datetime
 from decimal import Decimal
@@ -146,41 +147,155 @@ async def extract_text_llamaparse(file_bytes: bytes, filename: str) -> str:
         raise
 
 
+def _repair_json(raw: str) -> dict:
+    """Attempt to repair malformed JSON from AI responses.
+    Handles: trailing commas, truncated output, unclosed brackets."""
+
+    # Strip markdown code fences if present
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+
+    # Try direct parse first
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Fix 1: Remove trailing commas before ] or }
+    fixed = re.sub(r',\s*([\]}])', r'\1', raw)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # Fix 2: Truncated response — close open brackets/braces
+    # Count unclosed brackets
+    open_braces = fixed.count('{') - fixed.count('}')
+    open_brackets = fixed.count('[') - fixed.count(']')
+
+    # If truncated mid-object inside transactions array
+    if open_braces > 0 or open_brackets > 0:
+        # Remove the last incomplete object (after the last complete })
+        last_complete = fixed.rfind('}')
+        if last_complete > 0:
+            # Find the last comma before incomplete part
+            after = fixed[last_complete + 1:].strip()
+            if after.startswith(','):
+                fixed = fixed[:last_complete + 1]
+            elif after and not after[0] in ']}':
+                fixed = fixed[:last_complete + 1]
+
+        # Close remaining brackets
+        open_braces = fixed.count('{') - fixed.count('}')
+        open_brackets = fixed.count('[') - fixed.count(']')
+        fixed += ']' * max(0, open_brackets)
+        fixed += '}' * max(0, open_braces)
+
+    # Final trailing comma cleanup
+    fixed = re.sub(r',\s*([\]}])', r'\1', fixed)
+
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Could not repair JSON: {e}")
+
+
+PAGES_PER_CHUNK = 5  # Process 5 pages at a time
+
+
+async def _call_openai_chunk(client, text_chunk: str, is_first: bool) -> Dict[str, Any]:
+    """Send a single chunk to OpenAI and return parsed JSON."""
+    prompt = STRUCTURING_PROMPT
+    if not is_first:
+        prompt += "\n\nNOTE: This is a CONTINUATION of a multi-page statement. Extract ONLY the transactions from this section. For bank_name, account_number, period_start, period_end, opening_balance, closing_balance — set them to null (they were captured from the first chunk)."
+
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text_chunk},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=16000,
+    )
+
+    content = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason
+    logger.info(f"  Chunk response: {len(content)} chars, finish_reason={finish_reason}")
+
+    return _repair_json(content)
+
+
 async def structure_with_openai(extracted_text: str) -> Dict[str, Any]:
-    """Step 2: Use OpenAI GPT-4o to structure the extracted text into JSON."""
+    """Step 2: Use OpenAI GPT-4o to structure the extracted text into JSON.
+    For large statements, splits into chunks of 5 pages and merges results."""
 
     if not settings.OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY not configured")
 
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
-    logger.info(f"Sending {len(extracted_text)} chars to OpenAI for structuring...")
+    # Split text into pages
+    pages = extracted_text.split("--- PAGE BREAK ---")
+    page_count = len(pages)
+    logger.info(f"Statement has {page_count} pages, {len(extracted_text)} chars total")
 
+    # Small statement (≤5 pages) — single call
+    if page_count <= PAGES_PER_CHUNK:
+        logger.info("Small statement — single OpenAI call")
+        try:
+            result = await _call_openai_chunk(client, extracted_text, is_first=True)
+            txn_count = len(result.get("transactions", []))
+            logger.info(f"✅ Extracted {txn_count} transactions in single call")
+            return result
+        except Exception as e:
+            logger.error(f"OpenAI structuring failed: {e}")
+            raise
+
+    # Large statement — process in chunks of 5 pages
+    chunks = []
+    for i in range(0, page_count, PAGES_PER_CHUNK):
+        chunk_pages = pages[i:i + PAGES_PER_CHUNK]
+        chunks.append("\n\n--- PAGE BREAK ---\n\n".join(chunk_pages))
+
+    logger.info(f"Large statement — splitting into {len(chunks)} chunks of {PAGES_PER_CHUNK} pages each")
+
+    # Process first chunk (gets metadata + transactions)
     try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": STRUCTURING_PROMPT},
-                {"role": "user", "content": extracted_text},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
-            max_tokens=16000,
-        )
-
-        content = response.choices[0].message.content
-        structured = json.loads(content)
-
-        txn_count = len(structured.get("transactions", []))
-        logger.info(f"OpenAI extracted {txn_count} transactions")
-        return structured
-
-    except json.JSONDecodeError as e:
-        logger.error(f"OpenAI returned invalid JSON: {e}")
-        raise ValueError(f"Failed to parse AI response as JSON: {e}")
+        first_result = await _call_openai_chunk(client, chunks[0], is_first=True)
     except Exception as e:
-        logger.error(f"OpenAI structuring failed: {e}")
+        logger.error(f"First chunk failed: {e}")
         raise
+
+    all_transactions = first_result.get("transactions", [])
+    logger.info(f"  Chunk 1/{len(chunks)}: {len(all_transactions)} transactions")
+
+    # Process remaining chunks IN PARALLEL (transactions only)
+    import asyncio
+    async def _process_chunk(idx, chunk_text):
+        try:
+            chunk_result = await _call_openai_chunk(client, chunk_text, is_first=False)
+            chunk_txns = chunk_result.get("transactions", [])
+            logger.info(f"  Chunk {idx}/{len(chunks)}: {len(chunk_txns)} transactions")
+            return chunk_txns
+        except Exception as e:
+            logger.error(f"Chunk {idx} failed: {e}. Skipping.")
+            return []
+
+    if len(chunks) > 1:
+        tasks = [_process_chunk(idx, ct) for idx, ct in enumerate(chunks[1:], start=2)]
+        results = await asyncio.gather(*tasks)
+        for txns in results:
+            all_transactions.extend(txns)
+
+    # Merge: use first chunk's metadata + all transactions
+    first_result["transactions"] = all_transactions
+    logger.info(f"✅ Total: {len(all_transactions)} transactions from {len(chunks)} chunks")
+
+    return first_result
 
 
 def safe_date(val: Any) -> Optional[date]:

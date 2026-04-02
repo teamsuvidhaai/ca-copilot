@@ -95,7 +95,22 @@ def reconcile_gstr2b_vs_3b(file_bytes_list: List[bytes], filenames: List[str] = 
 # ══════════════════════════════════════════════════════════════
 
 def parse_gstr2b_excel(fbytes: bytes, fname: str) -> Dict:
-    """Parse GSTR-2B from .xlsx / .csv — sum all ITC tax components."""
+    """Parse GSTR-2B from .xlsx / .csv — handle all sheet types from GST portal.
+    
+    GSTR-2B sheets from GST Portal:
+      B2B        — B2B invoices (ITC available)
+      B2BA       — Amended B2B invoices
+      B2B-CDNR   — Credit/Debit notes (Credit Notes reduce ITC, Debit Notes add)
+      B2B-CDNRA  — Amended credit/debit notes
+      IMPG       — Import of goods (only IGST)
+      IMPGA      — Amended import of goods
+      ISD        — Input Service Distributor
+      ISDA       — Amended ISD
+    
+    Formula:
+      Net ITC = (B2B + B2BA) - (Credit Notes from CDNR/CDNRA) + (Debit Notes from CDNR/CDNRA)
+                + (IMPG + IMPGA) + (ISD + ISDA)
+    """
     try:
         xls = pd.ExcelFile(io.BytesIO(fbytes))
     except Exception:
@@ -103,46 +118,198 @@ def parse_gstr2b_excel(fbytes: bytes, fname: str) -> Dict:
         df = pd.read_csv(io.BytesIO(fbytes))
         return _sum_2b_dataframe(df)
 
-    logger.info(f"GSTR-2B sheets: {xls.sheet_names}")
+    sheet_names = xls.sheet_names
+    logger.info(f"GSTR-2B sheets: {sheet_names}")
+
     grand = {c: 0.0 for c in COMPONENTS}
     total_rows = 0
+    sheet_details = []
 
-    # Try B2B sheet first, then any sheet
-    for sn in xls.sheet_names:
-        sl = sn.lower()
-        if any(skip in sl for skip in ['summary', 'help', 'readme', 'overview']):
+    # Classify sheets
+    for sn in sheet_names:
+        sl = sn.lower().strip()
+
+        # Skip non-data sheets
+        if any(skip in sl for skip in ['summary', 'help', 'readme', 'overview', 'info', 'note']):
             continue
 
         try:
             df = pd.read_excel(xls, sheet_name=sn)
+            # Some GSTR-2B files have header info rows before the actual table.
+            # Try to detect and skip them by finding the actual header row.
+            df = _find_data_header(df)
             df.columns = [str(c).strip() for c in df.columns]
-        except Exception:
+        except Exception as e:
+            logger.warning(f"  ⚠️ Could not read sheet '{sn}': {e}")
             continue
 
-        tcols = _find_tax_cols(df)
+        # Find tax columns
+        tcols = _find_tax_cols_2b(df)
         if not tcols:
+            logger.warning(f"  ⚠️ No tax columns found in '{sn}', cols={list(df.columns)[:10]}")
             continue
 
         # Drop total/summary rows
         for col in df.select_dtypes('object').columns:
             df = df[~df[col].astype(str).str.strip().str.lower().isin(
-                ['total', 'grand total', 'sub total'])]
+                ['total', 'grand total', 'sub total', 'sub-total'])]
+
+        # Compute sheet ITC
+        sheet_itc = {c: 0.0 for c in COMPONENTS}
+        for c in COMPONENTS:
+            if c in tcols and tcols[c] in df.columns:
+                sheet_itc[c] = round(float(pd.to_numeric(df[tcols[c]], errors='coerce').fillna(0).sum()), 2)
+
+        sheet_total = sum(sheet_itc[c] for c in COMPONENTS)
+        rows_in_sheet = len(df)
+
+        # Determine how this sheet contributes to net ITC
+        if _is_cdnr_sheet(sl):
+            # CDNR / CDNRA: Check note_type column for Credit vs Debit
+            note_col = _find_note_type_col(df)
+            if note_col:
+                credit_itc, debit_itc = _split_cdnr_by_type(df, tcols, note_col)
+                for c in COMPONENTS:
+                    # Credit notes REDUCE ITC, Debit notes ADD ITC
+                    grand[c] += debit_itc[c] - credit_itc[c]
+                credit_total = sum(credit_itc[c] for c in COMPONENTS)
+                debit_total = sum(debit_itc[c] for c in COMPONENTS)
+                logger.info(f"  ✅ '{sn}' (CDNR): {rows_in_sheet} rows, "
+                           f"Credit Notes=-₹{credit_total:,.0f}, Debit Notes=+₹{debit_total:,.0f}")
+                sheet_details.append(f"{sn}: CN=-{credit_total:,.0f}, DN=+{debit_total:,.0f}")
+            else:
+                # No note type column — assume all are credit notes (standard behavior)
+                for c in COMPONENTS:
+                    grand[c] -= sheet_itc[c]
+                logger.info(f"  ✅ '{sn}' (CDNR, no type col): {rows_in_sheet} rows, "
+                           f"ITC deducted: -₹{sheet_total:,.0f}")
+                sheet_details.append(f"{sn}: -{sheet_total:,.0f}")
+        elif _is_impg_sheet(sl):
+            # IMPG / IMPGA: Only IGST is applicable for imports
+            for c in COMPONENTS:
+                grand[c] += sheet_itc[c]
+            logger.info(f"  ✅ '{sn}' (IMPG): {rows_in_sheet} rows, ITC=+₹{sheet_total:,.0f}")
+            sheet_details.append(f"{sn}: +{sheet_total:,.0f}")
+        else:
+            # B2B, B2BA, ISD, ISDA — add to ITC
+            for c in COMPONENTS:
+                grand[c] += sheet_itc[c]
+            logger.info(f"  ✅ '{sn}': {rows_in_sheet} rows, ITC=+₹{sheet_total:,.0f}")
+            sheet_details.append(f"{sn}: +{sheet_total:,.0f}")
+
+        total_rows += rows_in_sheet
+
+    grand = {c: round(v, 2) for c, v in grand.items()}
+    net_total = sum(grand[c] for c in COMPONENTS)
+    logger.warning(f"  📊 Net 2B ITC: ₹{net_total:,.2f} (from {total_rows} rows across {len(sheet_details)} sheets)")
+    for detail in sheet_details:
+        logger.info(f"    → {detail}")
+
+    return {'totals': grand, 'invoice_count': total_rows}
+
+
+def _find_data_header(df: pd.DataFrame) -> pd.DataFrame:
+    """Some GSTR-2B files have info rows before the actual data header.
+    Detect the real header row by looking for tax-related keywords."""
+    tax_keywords = ['igst', 'cgst', 'sgst', 'integrated', 'central', 'state',
+                    'tax amount', 'taxable', 'invoice', 'gstin', 'rate']
+
+    for idx in range(min(10, len(df))):
+        row_vals = [str(v).lower().strip() for v in df.iloc[idx].values if pd.notna(v)]
+        matches = sum(1 for val in row_vals if any(kw in val for kw in tax_keywords))
+        if matches >= 2:
+            # This row looks like a header
+            new_df = df.iloc[idx + 1:].copy()
+            new_df.columns = [str(v).strip() if pd.notna(v) else f'col_{i}'
+                             for i, v in enumerate(df.iloc[idx].values)]
+            new_df = new_df.reset_index(drop=True)
+            return new_df
+    return df
+
+
+def _find_tax_cols_2b(df: pd.DataFrame) -> Dict[str, str]:
+    """Find IGST/CGST/SGST/Cess columns in a 2B sheet.
+    Handles various naming conventions from GST portal downloads."""
+    mapping = {
+        'igst': ['igst', 'integrated tax', 'integrated tax (₹)', 'integrated tax(₹)',
+                 'iamt', 'integrated', 'igst amount', 'igst(₹)'],
+        'cgst': ['cgst', 'central tax', 'central tax (₹)', 'central tax(₹)',
+                 'camt', 'central', 'cgst amount', 'cgst(₹)'],
+        'sgst': ['sgst', 'state tax', 'state/ut tax', 'state/ut tax (₹)', 'state/ut tax(₹)',
+                 'samt', 'sgst/utgst', 'utgst', 'state/ut', 'sgst amount', 'sgst(₹)',
+                 'state tax (₹)', 'sgst/utgst(₹)'],
+        'cess': ['cess', 'cess (₹)', 'cess(₹)', 'csamt', 'cess amount'],
+    }
+    result = {}
+    for col in df.columns:
+        cl = str(col).lower().strip()
+        for comp, keywords in mapping.items():
+            if comp not in result:
+                # Exact match first
+                if cl in keywords:
+                    result[comp] = col
+                    break
+                # Partial match
+                if any(kw in cl for kw in keywords):
+                    # Avoid matching "igst" when looking for "sgst"
+                    if comp == 'sgst' and 'igst' in cl:
+                        continue
+                    result[comp] = col
+                    break
+    return result
+
+
+def _is_cdnr_sheet(sheet_lower: str) -> bool:
+    """Detect if sheet is a Credit/Debit Note sheet."""
+    return any(kw in sheet_lower for kw in ['cdnr', 'cdn', 'credit', 'debit', 'note'])
+
+
+def _is_impg_sheet(sheet_lower: str) -> bool:
+    """Detect if sheet is an Import of Goods sheet."""
+    return any(kw in sheet_lower for kw in ['impg', 'import'])
+
+
+def _find_note_type_col(df: pd.DataFrame) -> Optional[str]:
+    """Find the Note Type column (Credit/Debit) in CDNR sheets."""
+    for col in df.columns:
+        cl = str(col).lower().strip()
+        if any(kw in cl for kw in ['note type', 'document type', 'note_type', 'type']):
+            # Verify it contains credit/debit values
+            vals = df[col].astype(str).str.lower().str.strip().unique()
+            if any('credit' in v or 'debit' in v or v in ['c', 'd', 'cr', 'dr'] for v in vals):
+                return col
+    return None
+
+
+def _split_cdnr_by_type(df: pd.DataFrame, tcols: Dict, note_col: str) -> tuple:
+    """Split CDNR sheet into credit notes and debit notes."""
+    credit_itc = {c: 0.0 for c in COMPONENTS}
+    debit_itc = {c: 0.0 for c in COMPONENTS}
+
+    for _, row in df.iterrows():
+        note_type = str(row.get(note_col, '')).lower().strip()
+        # Check for Debit: exact match for single-char codes, keyword for text
+        is_debit = (note_type.startswith('debit') or 
+                    note_type in ('d', 'dr', 'dn') or
+                    note_type == 'debit note')
+
+        target = debit_itc if is_debit else credit_itc
 
         for c in COMPONENTS:
             if c in tcols and tcols[c] in df.columns:
-                grand[c] += round(float(pd.to_numeric(df[tcols[c]], errors='coerce').fillna(0).sum()), 2)
+                val = row.get(tcols[c], 0)
+                try:
+                    target[c] += abs(float(val)) if pd.notna(val) else 0
+                except (ValueError, TypeError):
+                    pass
 
-        total_rows += len(df)
-        logger.info(f"  ✅ '{sn}': {len(df)} rows, ITC={sum(grand[c] for c in COMPONENTS):,.0f}")
-
-    grand = {c: round(v, 2) for c, v in grand.items()}
-    return {'totals': grand, 'invoice_count': total_rows}
+    return credit_itc, debit_itc
 
 
 def _sum_2b_dataframe(df: pd.DataFrame) -> Dict:
     """Sum ITC from a single DataFrame (CSV or single sheet)."""
     df.columns = [str(c).strip() for c in df.columns]
-    tcols = _find_tax_cols(df)
+    tcols = _find_tax_cols_2b(df)
     grand = {c: 0.0 for c in COMPONENTS}
 
     for col in df.select_dtypes('object').columns:

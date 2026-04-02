@@ -170,3 +170,6 @@ google-credentials.json
 uploads/
 credentials.json
 token.json
+
+# Firebase credentials
+*firebase*adminsdk*.json

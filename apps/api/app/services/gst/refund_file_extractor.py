@@ -34,6 +34,190 @@ logger = logging.getLogger(__name__)
 # MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 
+# ── CA-domain: required files & field mapping per refund type ──
+# Each entry describes which file types are needed, which fields they
+# provide, and what textual impact a missing file has.
+_REFUND_FILE_REQUIREMENTS: Dict[str, List[Dict[str, Any]]] = {
+    "export_goods_lut": [
+        {
+            "file_type": "gstr3b",
+            "label": "GSTR-3B",
+            "required": True,
+            "fields_provided": ["itc_availed", "total_turnover", "exempt_turnover", "blocked_credit"],
+            "impact": "ITC availed, total turnover, and exempt turnover cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "gstr1",
+            "label": "GSTR-1 (Table 6A)",
+            "required": True,
+            "fields_provided": ["turnover_zero_rated_goods"],
+            "impact": "Zero-rated export turnover cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "purchase_register",
+            "label": "Purchase Register",
+            "required": False,
+            "fields_provided": ["itc_availed", "itc_capital_goods", "itc_input_services"],
+            "impact": "ITC breakdown (capital goods, input services) will use GSTR-3B totals only — Net ITC may be overstated",
+        },
+        {
+            "file_type": "shipping_bills",
+            "label": "Shipping Bills",
+            "required": False,
+            "fields_provided": ["shipping_bills_total"],
+            "impact": "FOB cross-check with GSTR-1 cannot be performed",
+        },
+    ],
+    "export_service_lut": [
+        {
+            "file_type": "gstr3b",
+            "label": "GSTR-3B",
+            "required": True,
+            "fields_provided": ["itc_availed", "total_turnover", "exempt_turnover", "blocked_credit"],
+            "impact": "ITC availed and total turnover cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "gstr1",
+            "label": "GSTR-1 (Table 6A)",
+            "required": True,
+            "fields_provided": ["turnover_zero_rated_services"],
+            "impact": "Zero-rated service export turnover cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "purchase_register",
+            "label": "Purchase Register",
+            "required": False,
+            "fields_provided": ["itc_availed", "itc_capital_goods"],
+            "impact": "ITC breakdown (capital goods) will use GSTR-3B totals only — Net ITC may be overstated",
+        },
+    ],
+    "export_igst": [
+        {
+            "file_type": "gstr1",
+            "label": "GSTR-1 (Table 6A with IGST)",
+            "required": True,
+            "fields_provided": ["igst_paid_on_exports", "shipping_bills_total"],
+            "impact": "IGST paid on export invoices cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "gstr3b",
+            "label": "GSTR-3B",
+            "required": False,
+            "fields_provided": ["igst_paid_on_exports"],
+            "impact": "IGST verification against GSTR-3B cannot be performed",
+        },
+        {
+            "file_type": "shipping_bills",
+            "label": "Shipping Bills",
+            "required": True,
+            "fields_provided": ["shipping_bills_total", "shipping_bills_matched"],
+            "impact": "ICEGATE shipping bill matching cannot be verified — refund may be withheld",
+        },
+    ],
+    "inverted_duty": [
+        {
+            "file_type": "gstr3b",
+            "label": "GSTR-3B",
+            "required": True,
+            "fields_provided": ["itc_availed", "total_turnover", "exempt_turnover", "blocked_credit"],
+            "impact": "ITC availed and total turnover cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "purchase_register",
+            "label": "Purchase Register (HSN-wise)",
+            "required": True,
+            "fields_provided": ["itc_availed", "itc_capital_goods"],
+            "impact": "HSN-wise input ITC breakup cannot be determined — Net ITC may be inaccurate",
+        },
+        {
+            "file_type": "sales_register",
+            "label": "Sales Register (HSN-wise)",
+            "required": True,
+            "fields_provided": ["turnover_inverted", "tax_payable_inverted"],
+            "impact": "Output tax on inverted rated supply cannot be determined — refund formula incomplete",
+        },
+        {
+            "file_type": "gstr1",
+            "label": "GSTR-1",
+            "required": False,
+            "fields_provided": ["turnover_inverted"],
+            "impact": "Inverted rated supply cross-check with GSTR-1 not possible",
+        },
+    ],
+    "deemed_export": [
+        {
+            "file_type": "gstr3b",
+            "label": "GSTR-3B",
+            "required": True,
+            "fields_provided": ["itc_availed", "total_turnover", "exempt_turnover", "blocked_credit"],
+            "impact": "ITC availed and total turnover cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "gstr1",
+            "label": "GSTR-1 (Table 6B)",
+            "required": True,
+            "fields_provided": ["turnover_zero_rated_goods"],
+            "impact": "Deemed export turnover cannot be determined — refund will be ₹0",
+        },
+        {
+            "file_type": "purchase_register",
+            "label": "Purchase Register",
+            "required": False,
+            "fields_provided": ["itc_availed", "itc_capital_goods"],
+            "impact": "ITC breakdown will use GSTR-3B totals only — Net ITC may be overstated",
+        },
+    ],
+    "excess_cash": [
+        {
+            "file_type": "cash_ledger",
+            "label": "Electronic Cash Ledger",
+            "required": True,
+            "fields_provided": ["cash_ledger_balance"],
+            "impact": "Cash ledger balance cannot be determined — refund will be ₹0",
+        },
+    ],
+}
+
+# ── Critical fields per refund type ──
+# If ANY of these are zero/missing after extraction, the refund will be ₹0 or meaningless.
+_CRITICAL_FIELDS: Dict[str, List[Dict[str, str]]] = {
+    "export_goods_lut": [
+        {"field": "turnover_zero_rated_goods", "label": "Zero-Rated Goods Turnover",
+         "source": "GSTR-1 Table 6A or GSTR-3B Table 3.1(b)"},
+        {"field": "itc_availed", "label": "ITC Availed",
+         "source": "GSTR-3B Table 4 or Purchase Register"},
+    ],
+    "export_service_lut": [
+        {"field": "turnover_zero_rated_services", "label": "Zero-Rated Services Turnover",
+         "source": "GSTR-1 Table 6A or GSTR-3B Table 3.1(b)"},
+        {"field": "itc_availed", "label": "ITC Availed",
+         "source": "GSTR-3B Table 4 or Purchase Register"},
+    ],
+    "export_igst": [
+        {"field": "igst_paid_on_exports", "label": "IGST Paid on Exports",
+         "source": "GSTR-1 Table 6A (WPAY invoices) or GSTR-3B"},
+    ],
+    "inverted_duty": [
+        {"field": "turnover_inverted", "label": "Inverted Rated Supply Turnover",
+         "source": "Sales Register or GSTR-1"},
+        {"field": "itc_availed", "label": "ITC Availed",
+         "source": "GSTR-3B Table 4 or Purchase Register"},
+        {"field": "tax_payable_inverted", "label": "Output Tax on Inverted Supply",
+         "source": "Sales Register"},
+    ],
+    "deemed_export": [
+        {"field": "turnover_zero_rated_goods", "label": "Deemed Export Turnover",
+         "source": "GSTR-1 Table 6B or GSTR-3B"},
+        {"field": "itc_availed", "label": "ITC Availed",
+         "source": "GSTR-3B Table 4 or Purchase Register"},
+    ],
+    "excess_cash": [
+        {"field": "cash_ledger_balance", "label": "Cash Ledger Balance",
+         "source": "Electronic Cash Ledger statement"},
+    ],
+}
+
+
 def extract_refund_values(
     file_bytes_list: List[bytes],
     filenames: List[str],
@@ -45,7 +229,8 @@ def extract_refund_values(
 
     Returns:
         Dict with keys matching the refund_type field IDs,
-        plus _extraction_notes and _file_types_found metadata.
+        plus _extraction_notes, _file_types_found, and
+        _completeness_warnings metadata.
     """
     extracted: Dict[str, Any] = {"refund_type": refund_type}
     extraction_notes: List[str] = []
@@ -84,10 +269,124 @@ def extract_refund_values(
             logger.warning(f"  ✗ Failed to extract from '{filename}': {e}", exc_info=True)
             extraction_notes.append(f"❌ Error processing '{filename}': {str(e)}")
 
+    # ── CA-Domain Validation: missing files & critical fields ──
+    completeness = _validate_completeness(
+        refund_type, file_types_found, extracted
+    )
+    extraction_notes.extend(completeness["warnings"])
+
     extracted["_extraction_notes"] = extraction_notes
     extracted["_file_types_found"] = file_types_found
+    extracted["_completeness"] = completeness
 
     return extracted
+
+
+def _validate_completeness(
+    refund_type: str,
+    file_types_found: List[str],
+    extracted: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    CA-domain validation: check which document types are missing for this
+    refund type and which critical calculation fields are still zero.
+
+    Returns a dict with:
+      - status: 'complete' | 'partial' | 'insufficient'
+      - missing_files: list of missing file descriptions
+      - missing_critical_fields: list of zero/missing critical fields
+      - warnings: human-readable warning strings
+    """
+    warnings: List[str] = []
+    missing_files: List[Dict[str, str]] = []
+    missing_critical: List[Dict[str, str]] = []
+
+    requirements = _REFUND_FILE_REQUIREMENTS.get(refund_type, [])
+    critical_fields = _CRITICAL_FIELDS.get(refund_type, [])
+
+    # Normalize found types (handle json variants like 'gstr3b_json')
+    found_set = set()
+    for ft in file_types_found:
+        base = ft.replace("_json", "")
+        found_set.add(base)
+
+    # ── Check required file types ──
+    required_missing = 0
+    optional_missing = 0
+
+    for req in requirements:
+        ftype = req["file_type"]
+        if ftype not in found_set:
+            missing_files.append({
+                "file_type": ftype,
+                "label": req["label"],
+                "required": req["required"],
+                "impact": req["impact"],
+            })
+
+            prefix = "❗" if req["required"] else "⚠️"
+            kind = "Required" if req["required"] else "Optional"
+            warnings.append(
+                f"{prefix} Missing {req['label']} ({kind}) — {req['impact']}"
+            )
+
+            if req["required"]:
+                required_missing += 1
+            else:
+                optional_missing += 1
+
+    # ── Check critical extracted values ──
+    for cf in critical_fields:
+        val = extracted.get(cf["field"], 0)
+        if not val or (isinstance(val, (int, float)) and val == 0):
+            # Only warn if the value is still zero AND the file that provides
+            # it was not found (avoid duplicate noise)
+            already_warned = any(
+                cf["field"] in req.get("fields_provided", [])
+                for req in requirements
+                if req["file_type"] not in found_set
+            )
+            missing_critical.append({
+                "field": cf["field"],
+                "label": cf["label"],
+                "source": cf["source"],
+            })
+            if not already_warned:
+                warnings.append(
+                    f"⚠️ {cf['label']} is ₹0 — expected from {cf['source']}. "
+                    f"The refund amount may be ₹0."
+                )
+
+    # ── Determine overall status ──
+    if required_missing > 0 or len(missing_critical) == len(critical_fields):
+        status = "insufficient"
+    elif optional_missing > 0 or len(missing_critical) > 0:
+        status = "partial"
+    else:
+        status = "complete"
+
+    # Summary line
+    total_req = sum(1 for r in requirements if r["required"])
+    found_req = total_req - required_missing
+    if status == "complete":
+        warnings.insert(0, f"✅ All required documents provided ({found_req}/{total_req})")
+    elif status == "partial":
+        warnings.insert(0,
+            f"⚠️ Partial data: {found_req}/{total_req} required documents found. "
+            f"Calculation will proceed but may be inaccurate."
+        )
+    else:
+        warnings.insert(0,
+            f"❗ Insufficient data: only {found_req}/{total_req} required documents found. "
+            f"Refund calculation may return ₹0 or be unreliable."
+        )
+
+    return {
+        "status": status,
+        "missing_files": missing_files,
+        "missing_critical_fields": missing_critical,
+        "warnings": warnings,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════

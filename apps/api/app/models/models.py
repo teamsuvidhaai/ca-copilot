@@ -12,6 +12,10 @@ from pgvector.sqlalchemy import Vector
 from app.db.base import Base
 
 # Enums
+class AccountType(str, PyEnum):
+    CA_FIRM = "ca_firm"
+    CORPORATE = "corporate"
+
 class UserRole(str, PyEnum):
     OWNER = "owner"
     ADMIN = "admin"
@@ -64,6 +68,7 @@ class Firm(Base):
     __tablename__ = "firms"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
+    account_type = Column(String, default="ca_firm", nullable=False, server_default="ca_firm")
     created_at = Column(DateTime, default=datetime.utcnow)
 
     users = relationship("User", back_populates="firm")
@@ -80,11 +85,28 @@ class User(Base):
     subscription_plan = Column(String, default="free")
     role = Column(Enum(UserRole), default=UserRole.STAFF)
     signup_method = Column(String, default="email", nullable=False)
+    email_verified = Column(Boolean, default=False, nullable=False, server_default="false")
+    phone_verified = Column(Boolean, default=False, nullable=False, server_default="false")
     firm_id = Column(UUID(as_uuid=True), ForeignKey("firms.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     trial_started_at = Column(DateTime, default=datetime.utcnow)  # 30-day free trial starts at signup
 
     firm = relationship("Firm", back_populates="users")
+
+
+class OTPVerification(Base):
+    """Stores OTP codes for email/phone verification during signup and login."""
+    __tablename__ = "otp_verifications"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    identifier = Column(String(255), nullable=False, index=True)   # email or phone number
+    identifier_type = Column(String(10), nullable=False)           # 'email' or 'phone'
+    otp_code = Column(String(6), nullable=False)                   # 6-digit code
+    purpose = Column(String(20), nullable=False)                   # 'signup', 'login', 'reset'
+    attempts = Column(Integer, default=0, nullable=False)          # wrong attempts counter
+    is_verified = Column(Boolean, default=False, nullable=False)
+    verification_token = Column(String(64), nullable=True, index=True)  # returned after verify
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)                  # 10 min from creation
 
 class Client(Base):
     __tablename__ = "clients"
@@ -518,4 +540,129 @@ class BankTransaction(Base):
 
     __table_args__ = (
         Index('idx_bank_txn_stmt', 'statement_id'),
+    )
+
+
+# ═══════════════════════════════════════════════════════
+# Financial Instruments — Upload + AI extraction
+# ═══════════════════════════════════════════════════════
+
+class FinancialInstrumentUpload(Base):
+    """One row per uploaded Demat/MF/PMS statement.
+    AI extracts holdings, transactions, capital gains → journal entries.
+    Structured data and journal entries stored as JSONB."""
+    __tablename__ = "fi_uploads"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    instrument_type = Column(String(30), nullable=False)          # demat, mutual_fund, pms
+    filename = Column(String(500), nullable=False)
+    file_path = Column(Text, nullable=True)                       # Supabase storage path
+    file_hash = Column(String(64), nullable=True, index=True)     # SHA-256 for duplicate detection
+    status = Column(String(30), default="processing")             # processing, extracting, structuring, generating_entries, completed, failed
+    error_message = Column(Text, nullable=True)
+    raw_text = Column(Text, nullable=True)                        # first 2000 chars of extracted text
+    structured_data = Column(JSONB, nullable=True)                # AI-extracted holdings/transactions/dividends
+    journal_entries = Column(JSONB, nullable=True, default=[])    # AI-generated Dr/Cr entries
+    journal_entry_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_fi_upload_client', 'client_id'),
+        Index('idx_fi_upload_hash', 'client_id', 'file_hash'),
+        Index('idx_fi_upload_type', 'client_id', 'instrument_type'),
+    )
+
+
+# ═══════════════════════════════════════════════════════
+# Financial Statements — BS/P&L/Schedules generation
+# ═══════════════════════════════════════════════════════
+
+class FinancialStatementJob(Base):
+    """One row per Financial Statement generation job.
+    Upload Trial Balance + optional prev-year BS + Notes →
+    AI maps accounts → comparative Balance Sheet, P&L, Schedules.
+    All structured data stored as JSONB for flexible querying."""
+    __tablename__ = "fs_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+
+    # Uploaded file metadata
+    filenames = Column(JSONB, nullable=True, default={})            # {"trial_balance": "tb.xlsx", "prev_balance_sheet": "bs.pdf", ...}
+    file_paths = Column(JSONB, nullable=True, default={})           # Supabase storage paths per role
+    file_hash = Column(String(64), nullable=True, index=True)       # SHA-256 of TB for duplicate detection
+
+    # Processing status
+    status = Column(String(30), default="processing")               # processing, extracting, parsing_tb, parsing_bs, generating, completed, failed
+    error_message = Column(Text, nullable=True)
+
+    # Intermediate data
+    raw_texts = Column(JSONB, nullable=True, default={})            # {"trial_balance": "...", "prev_balance_sheet": "...", "notes": "..."}
+    trial_balance_data = Column(JSONB, nullable=True)               # Structured TB from AI
+    prev_bs_data = Column(JSONB, nullable=True)                     # Structured prev-year BS from AI
+
+    # Final result
+    result = Column(JSONB, nullable=True)                           # Full result: balance_sheet, profit_and_loss, schedules, mappings, warnings
+
+    # Metadata
+    company_name = Column(String(500), nullable=True)
+    financial_year = Column(String(20), nullable=True)              # e.g. "2024-25"
+    is_balanced = Column(Boolean, nullable=True)                    # Balance Sheet tallied?
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_fs_job_client', 'client_id'),
+        Index('idx_fs_job_hash', 'client_id', 'file_hash'),
+        Index('idx_fs_job_status', 'client_id', 'status'),
+    )
+
+
+# ═══════════════════════════════════════════════════════
+# Rule 42 ITC Reversal — Persisted monthly computations
+# ═══════════════════════════════════════════════════════
+
+class Rule42Computation(Base):
+    """One row per Rule 42 ITC reversal computation (client × period × tax_head).
+    Stores both inputs and computed results as JSONB for flexibility.
+    Monthly computations are provisional; annual true-up adjusts them."""
+    __tablename__ = "rule42_computations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    firm_id = Column(UUID(as_uuid=True), ForeignKey("firms.id"), nullable=False, index=True)
+
+    # Period identification
+    period = Column(String(7), nullable=False)               # "2025-04" (YYYY-MM)
+    financial_year = Column(String(9), nullable=False)        # "2025-2026"
+    tax_head = Column(String(10), nullable=False, default="cgst")  # cgst / sgst / igst
+
+    # Inputs & Results (JSONB for flexibility)
+    inputs = Column(JSONB, nullable=False, default={})        # {T, T1, T2, T3, E, N, F}
+    results = Column(JSONB, nullable=False, default={})       # {C1, D1, D2, C2, C3, C4, ratio, totalRev, ...}
+
+    # Status workflow
+    status = Column(String(20), nullable=False, default="draft")  # draft / final / annual_adjusted
+
+    # Working notes
+    notes = Column(Text, nullable=True)
+
+    # Metadata
+    auto_filled_fields = Column(JSONB, nullable=True, default=[])  # e.g. ["T", "E", "F"] if from GSTR-3B
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        sa.UniqueConstraint('client_id', 'period', 'tax_head', name='uq_rule42_client_period_taxhead'),
+        Index('idx_rule42_client', 'client_id'),
+        Index('idx_rule42_firm', 'firm_id'),
+        Index('idx_rule42_fy', 'client_id', 'financial_year'),
+        Index('idx_rule42_period', 'client_id', 'period'),
     )

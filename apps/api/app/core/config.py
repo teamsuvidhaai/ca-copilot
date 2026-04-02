@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     # GST Services
     APPYFLOW_API_KEY: Optional[str] = None
 
+    # Email OTP (Resend)
+    RESEND_API_KEY: Optional[str] = None
+
+    # Firebase Phone Auth
+    FIREBASE_SERVICE_ACCOUNT_PATH: Optional[str] = None
+
     # LlamaParse (document parsing)
     LLAMA_CLOUD_API_KEY: Optional[str] = None
 

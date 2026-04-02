@@ -42,6 +42,9 @@ SHEET_POSITIVE = [
     'b2b', 'purchase', 'sales', 'data', 'invoice', 'register',
     'pr', 'sr', 'detail', 'transaction', 'voucher', 'b2ba', 'cdnr',
     'sheet1', 'report',
+    # Busy-specific
+    'gst register', 'purchase register', 'sale register',
+    'input tax', 'output tax',
 ]
 
 # Sheet names that are definitely NOT invoice data
@@ -85,6 +88,10 @@ COLUMN_SYNONYMS = {
             ('document number', 10),
             ('document no', 10),
             ('doc no', 8),
+            # Busy software patterns
+            ('vch no.', 6),
+            ('vch no', 6),
+            ('vch number', 6),
             # LOW priority — fallback only (voucher/bill/ref)
             ('voucher number', 3),
             ('voucher no.', 3),
@@ -113,6 +120,10 @@ COLUMN_SYNONYMS = {
             ('taxable amt', 10),
             ('taxable val', 10),
             ('assessable value', 8),
+            # Busy uses "Assessable Value" or "Value" columns
+            ('value of goods', 7),
+            ('value of supply', 7),
+            ('goods value', 7),
             ('net amount', 5),
             ('base amount', 5),
         ],
@@ -142,6 +153,8 @@ COLUMN_SYNONYMS = {
             ('sgst amt', 10),
             ('sgst', 8),
             ('utgst', 7),
+            # Busy format
+            ('state gst', 7),
         ],
     },
     'cess': {
@@ -206,7 +219,19 @@ COLUMN_SYNONYMS = {
         'patterns': [
             ('voucher type', 10),
             ('transaction type', 8),
+            # Busy software patterns
+            ('vch type', 10),
+            ('voucher kind', 7),
             ('type', 2),
+        ],
+    },
+    # Busy-specific: "Account Name" / "Account Head"
+    'account_name': {
+        'patterns': [
+            ('account name', 8),
+            ('account head', 8),
+            ('a/c name', 7),
+            ('a/c head', 7),
         ],
     },
 }
@@ -237,14 +262,19 @@ NAME_STOPWORDS = {
 # filter to prevent false positives.
 NAME_MATCH_THRESHOLD = 0.60
 
-# Voucher types to always include from Tally exports
+# Voucher types to always include from Tally/Busy exports
 TALLY_VOUCHER_TYPES_ALWAYS = [
     'purchase', 'debit note',
+    # Busy software uses these values
+    'purchase voucher', 'purchase invoice',
+    'pur. voucher', 'pur voucher',
+    'debit memo', 'dr. note', 'dr note',
 ]
 
 # Voucher types to include ONLY if they have GST amounts
 TALLY_VOUCHER_TYPES_CONDITIONAL = [
-    'journal',
+    'journal', 'jounal',  # common misspelling in some exports
+    'journal voucher',
 ]
 
 
@@ -264,6 +294,10 @@ def reconcile_gst(input_bytes_list: List[bytes], filenames: List[str] = None, jo
     # Load
     df1 = load_reconciliation_file(input_bytes_list[0], fn1)
     df2 = load_reconciliation_file(input_bytes_list[1], fn2)
+    
+    # Transform Busy format if detected (adds IGST/CGST/SGST columns)
+    df1 = transform_busy_format(df1, fn1)
+    df2 = transform_busy_format(df2, fn2)
     
     logger.info(f"━━━ Source 1 ({fn1}): {len(df1)} rows, cols: {list(df1.columns)[:10]}...")
     logger.info(f"━━━ Source 2 ({fn2}): {len(df2)} rows, cols: {list(df2.columns)[:10]}...")
@@ -365,6 +399,185 @@ def pick_best_sheet(xls: pd.ExcelFile) -> str:
     
     logger.info(f"  Sheet selected: '{best_name}' (score: {best_score}) from {names}")
     return best_name
+
+
+# ═══════════════════════════════════════════════════════════════
+# BUSY FORMAT DETECTION & TRANSFORMATION
+# ═══════════════════════════════════════════════════════════════
+
+# Busy GST Type patterns:
+#   I/GST-28%      → Interstate @ 28% → IGST = Total * 28/128
+#   L/GST-28%      → Local @ 28%      → CGST = Total * 14/128, SGST = same
+#   I/GST-18%      → Interstate @ 18% → IGST = Total * 18/118
+#   L/GST-18%      → Local @ 18%      → CGST = Total * 9/118, SGST = same
+#   I/GST-MultiRate → Mixed rates (can't split precisely — use total as-is)
+#   L/GST-MultiRate → Mixed rates local
+
+BUSY_GST_PATTERN = re.compile(r'^([IL])/GST-(\d+%|MultiRate)', re.IGNORECASE)
+
+
+def detect_busy_format(df: pd.DataFrame) -> bool:
+    """
+    Detect if DataFrame is in Busy accounting software format.
+    
+    Busy format characteristics:
+    1. Has a 'Type' column with values like 'I/GST-28%', 'L/GST-28%'
+    2. Has 'Total Amount' column but NO separate IGST/CGST/SGST columns
+    3. Has 'Account' column (supplier) instead of 'Party Name'
+    4. Has 'Vch/Bill No' column
+    """
+    cols_lower = {str(c).lower().strip() for c in df.columns}
+    
+    # Must have Type column
+    has_type = any('type' in c for c in cols_lower)
+    if not has_type:
+        return False
+    
+    # Must NOT already have IGST/CGST/SGST columns (already Tally/standard format)
+    has_tax_cols = any(c in cols_lower for c in ['igst', 'cgst', 'sgst', 'integrated tax', 'central tax', 'state tax'])
+    if has_tax_cols:
+        return False
+    
+    # Must have Total Amount or similar
+    has_amount = any(c in cols_lower for c in ['total amount', 'amount', 'total amt', 'gross amount'])
+    if not has_amount:
+        return False
+    
+    # Check if Type column contains Busy GST patterns
+    type_col = None
+    for c in df.columns:
+        if str(c).lower().strip() == 'type':
+            type_col = c
+            break
+    
+    if type_col is None:
+        return False
+    
+    type_vals = df[type_col].dropna().astype(str).str.strip().head(20)
+    gst_matches = type_vals.str.match(BUSY_GST_PATTERN, na=False).sum()
+    
+    return gst_matches >= 2  # At least 2 rows with GST type patterns
+
+
+def transform_busy_format(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    """
+    Transform Busy accounting software Purchase Register into standard format.
+    
+    Busy PR has: Date, Vch/Bill No, Account, Type, Total Amount, Material Centre
+    We need:     Date, inv_num, supplier_name, voucher_type, taxable, igst, cgst, sgst
+    
+    Tax calculation from Total Amount:
+      For rate R% on Total Amount T:
+        Taxable Value = T / (1 + R/100) = T * 100 / (100 + R)
+        Tax = T - Taxable = T * R / (100 + R)
+        
+      I/GST (Interstate): IGST = Tax, CGST = 0, SGST = 0
+      L/GST (Local):       IGST = 0, CGST = Tax/2, SGST = Tax/2
+    """
+    if not detect_busy_format(df):
+        return df
+    
+    logger.info(f"  🔄 Busy format detected in '{filename}' — transforming to standard format")
+    
+    # Find actual column names (case-insensitive matching)
+    col_map = {}
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if cl == 'type': col_map['type'] = c
+        elif cl in ['total amount', 'amount', 'total amt', 'gross amount']: col_map['amount'] = c
+        elif cl in ['account', 'party', 'party name', 'account name']: col_map['account'] = c
+        elif cl in ['vch/bill no', 'vch no', 'vch no.', 'bill no', 'bill no.', 'voucher no']: col_map['bill'] = c
+        elif cl == 'date': col_map['date'] = c
+        elif cl in ['material centre', 'godown']: col_map['mc'] = c
+    
+    # Build new DataFrame with standard columns
+    new_rows = []
+    multi_rate_count = 0
+    
+    for _, row in df.iterrows():
+        gst_type = str(row.get(col_map.get('type', 'Type'), '')).strip()
+        total_amt = float(row.get(col_map.get('amount', 'Total Amount'), 0) or 0)
+        
+        # Skip total/empty rows
+        if gst_type.lower() in ('totals', 'total', 'grand total', '', 'nan', 'none'):
+            continue
+        if total_amt == 0:
+            continue
+        
+        # Parse GST type
+        m = BUSY_GST_PATTERN.match(gst_type)
+        if not m:
+            # Non-GST row (exempt, nil-rated, etc.) — include with zero tax
+            new_rows.append({
+                'Date': row.get(col_map.get('date', 'Date')),
+                'Invoice No': row.get(col_map.get('bill', 'Vch/Bill No'), ''),
+                'Party Name': str(row.get(col_map.get('account', 'Account'), '')).strip(),
+                'Voucher Type': 'Purchase',
+                'Taxable Value': total_amt,
+                'IGST': 0, 'CGST': 0, 'SGST': 0, 'Cess': 0,
+                'Total Amount': total_amt,
+                'GST Type': gst_type,
+            })
+            continue
+        
+        scope = m.group(1).upper()  # 'I' or 'L'
+        rate_str = m.group(2)       # '28%' or 'MultiRate'
+        
+        if rate_str.lower() == 'multirate':
+            # MultiRate — can't determine exact split. Use 18% as default estimate
+            rate = 18.0
+            multi_rate_count += 1
+        else:
+            rate = float(rate_str.replace('%', ''))
+        
+        # Reverse-calculate tax from inclusive amount
+        taxable = round(total_amt * 100 / (100 + rate), 2)
+        total_tax = round(total_amt - taxable, 2)
+        
+        igst = 0.0
+        cgst = 0.0
+        sgst = 0.0
+        
+        if scope == 'I':
+            # Interstate — all IGST
+            igst = total_tax
+        else:
+            # Local — split equally between CGST and SGST
+            cgst = round(total_tax / 2, 2)
+            sgst = round(total_tax / 2, 2)
+        
+        new_rows.append({
+            'Date': row.get(col_map.get('date', 'Date')),
+            'Invoice No': str(row.get(col_map.get('bill', 'Vch/Bill No'), '')).strip(),
+            'Party Name': str(row.get(col_map.get('account', 'Account'), '')).strip(),
+            'Voucher Type': 'Purchase',
+            'Taxable Value': taxable,
+            'IGST': igst,
+            'CGST': cgst,
+            'SGST': sgst,
+            'Cess': 0,
+            'Total Amount': total_amt,
+            'GST Type': gst_type,
+        })
+    
+    if not new_rows:
+        logger.warning(f"  ⚠️ Busy transform produced 0 rows from {len(df)} input rows")
+        return df
+    
+    result = pd.DataFrame(new_rows)
+    
+    total_igst = result['IGST'].sum()
+    total_cgst = result['CGST'].sum()
+    total_sgst = result['SGST'].sum()
+    total_taxable = result['Taxable Value'].sum()
+    
+    logger.info(f"  ✅ Busy → Standard: {len(result)} rows, "
+               f"Taxable=₹{total_taxable:,.0f}, "
+               f"IGST=₹{total_igst:,.0f}, CGST=₹{total_cgst:,.0f}, SGST=₹{total_sgst:,.0f}")
+    if multi_rate_count:
+        logger.warning(f"  ⚠️ {multi_rate_count} MultiRate entries — tax split estimated at 18%")
+    
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -596,11 +809,32 @@ def tokenize_supplier_name(name: str) -> set:
     s = re.sub(r'\bSOLUTIONS\b', 'SOLN', s)
     s = re.sub(r'\bSERVICES\b', 'SVC', s)
     
+    # Merge dot-separated initials BEFORE removing punctuation
+    # A.P. → AP, S.K.F. → SKF, V.V.P. → VVP
+    s = re.sub(r'\b([A-Z])\.([A-Z])\.([A-Z])\.?', r'\1\2\3', s)
+    s = re.sub(r'\b([A-Z])\.([A-Z])\.?', r'\1\2', s)
+    
     # Remove all punctuation → replace with space
     s = re.sub(r'[^A-Z0-9\s]', ' ', s)
     
     # Split into tokens
     tokens = s.split()
+    
+    # Merge consecutive single-letter tokens into one
+    # e.g., ['A', 'P', 'MOTORS'] → ['AP', 'MOTORS']
+    merged = []
+    buf = ''
+    for t in tokens:
+        if len(t) == 1 and t.isalpha():
+            buf += t
+        else:
+            if buf:
+                merged.append(buf)
+                buf = ''
+            merged.append(t)
+    if buf:
+        merged.append(buf)
+    tokens = merged
     
     # Remove stopwords
     meaningful = {t for t in tokens if t not in NAME_STOPWORDS and len(t) > 0}
@@ -667,25 +901,43 @@ def clean_dr_cr(val):
         return 0.0
 
 
-def is_supplier_invoice_format(series: pd.Series) -> bool:
+def is_supplier_invoice_format(series: pd.Series, display_series: pd.Series = None) -> bool:
     """
     Check if invoice number values look like supplier invoice numbers
-    (e.g., VP/034/25-26, TFI/25-26/01557, SPI/25-26/8) rather than
-    internal Tally voucher numbers (11, 12, 18, 302).
+    (e.g., VP/034/25-26, TFI/25-26/01557, SPI/25-26/8, VVP2504104, SSC/3/25-26)
+    rather than internal Tally voucher numbers (11, 12, 18, 302).
     
-    Supplier invoices typically contain letters mixed with / or -.
-    Returns True if >30% of sampled values match this pattern.
+    Uses display_series (pre-normalized) if available, falling back to series.
+    
+    Supplier invoices:
+      Pattern 1: letters mixed with / or - (e.g., 'BWD/25/MOS/02', '2025/26-0096')
+      Pattern 2: letters + digits mixed together, length > 5 (e.g., 'VVP2504104', 'SSC32526')
+    
+    Internal vouchers: pure short numbers (1, 2, 11, 302)
+    
+    Returns True if >30% of sampled values match either pattern.
     """
-    sample = series.dropna().astype(str).str.strip()
+    # Use display (pre-normalized) values if available
+    check = display_series if display_series is not None else series
+    sample = check.dropna().astype(str).str.strip()
     sample = sample[~sample.isin(['', 'NAN', 'NONE', 'NA'])].head(20)
     if len(sample) == 0:
         return False
-    # Pattern: letters followed by / or -, or / or - followed by letters
-    has_supplier_pattern = sample.str.contains(
+    
+    # Pattern 1: Contains letters AND separators (/ or -)
+    pattern1 = sample.str.contains(
         r'[A-Za-z].*[/\-]|[/\-].*[A-Za-z]', regex=True
     ).mean()
-    result = has_supplier_pattern > 0.3
-    logger.info(f"  🔍 Invoice format check: {has_supplier_pattern*100:.0f}% look like supplier invoices → "
+    
+    # Pattern 2: Alphanumeric mix with length > 5 (VVP2504104, SSC32526, PPA0025202526)
+    # NOT just a pure number and NOT just pure letters
+    pattern2 = sample.apply(
+        lambda x: len(x) > 5 and bool(re.search(r'[A-Za-z]', x)) and bool(re.search(r'\d', x))
+    ).mean()
+    
+    # Either pattern match triggers supplier format
+    result = pattern1 > 0.3 or pattern2 > 0.3
+    logger.info(f"  🔍 Invoice format check: pattern1={pattern1*100:.0f}%, pattern2={pattern2*100:.0f}% → "
                 f"{'supplier format' if result else 'internal voucher format'}")
     return result
 
@@ -962,10 +1214,12 @@ def match_data(df1: pd.DataFrame, df2: pd.DataFrame, job_type: str) -> pd.DataFr
     
     if is_tally_pr_job:
         # Check if PR has supplier invoice numbers (not internal voucher numbers)
+        # Use inv_num_display (pre-normalized) for format check if available
+        pr_display = df2.get('inv_num_display', df2.get('inv_num'))
         pr_has_supplier_invnums = (
             'inv_num' in df2.columns and
             'inv_num' in df1.columns and
-            is_supplier_invoice_format(df2['inv_num'])
+            is_supplier_invoice_format(df2['inv_num'], display_series=pr_display)
         )
         
         if pr_has_supplier_invnums:

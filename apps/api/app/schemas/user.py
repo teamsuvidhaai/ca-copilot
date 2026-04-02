@@ -4,7 +4,7 @@ from typing import Optional
 from uuid import UUID
 from pydantic import BaseModel, EmailStr, field_validator
 
-from app.models.models import UserRole, SignupMethod
+from app.models.models import UserRole, SignupMethod, AccountType
 
 # ───────────────────────────────────────
 # Shared properties
@@ -57,10 +57,12 @@ def validate_password_strength(value: str) -> str:
 # Email Signup (existing flow)
 # ───────────────────────────────────────
 class UserCreate(UserBase):
-    """Sign up with email + password (original flow)."""
+    """Sign up with email + password (requires OTP verification)."""
     email: EmailStr
     password: str
     firm_name: str  # Used during signup to create the firm
+    account_type: str = "ca_firm"  # 'ca_firm' or 'corporate'
+    verification_token: Optional[str] = None  # From OTP verification step
 
     @field_validator('password')
     @classmethod
@@ -72,12 +74,14 @@ class UserCreate(UserBase):
 # Phone Signup
 # ───────────────────────────────────────
 class UserCreatePhone(BaseModel):
-    """Sign up with phone number + password."""
+    """Sign up with phone number + password (requires OTP verification)."""
     phone_number: str
     password: str
     full_name: str
     firm_name: str
+    account_type: str = "ca_firm"  # 'ca_firm' or 'corporate'
     email: Optional[EmailStr] = None  # Optional – can add later
+    verification_token: Optional[str] = None  # From OTP verification step
 
     @field_validator('phone_number')
     @classmethod
@@ -97,6 +101,7 @@ class UserCreateGoogle(BaseModel):
     """Sign up / login with Google OAuth id_token."""
     google_id_token: str
     firm_name: Optional[str] = None  # Optional for returning users
+    account_type: str = "ca_firm"  # 'ca_firm' or 'corporate'
 
 
 # ───────────────────────────────────────
@@ -137,6 +142,7 @@ class UserInDBBase(UserBase):
 # Additional properties to return via API
 class User(UserInDBBase):
     firm_name: Optional[str] = None
+    account_type: Optional[str] = "ca_firm"
 
 class UserInDB(UserInDBBase):
     hashed_password: Optional[str] = None

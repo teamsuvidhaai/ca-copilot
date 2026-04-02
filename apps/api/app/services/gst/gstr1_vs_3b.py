@@ -19,8 +19,15 @@ logger = logging.getLogger(__name__)
 COMPONENTS = ['taxable', 'igst', 'cgst', 'sgst', 'cess']
 
 # Sheets to skip in GSTR-1 (not outward supply data)
+# IMPORTANT: Table 12 (HSN Summary) and Table 15/16 (Totals) contain the SAME
+# data as the section sheets (B2B, B2CL, etc.) — including them double/triple counts.
 SKIP_SHEETS = ['cdnr', 'cdnur', 'cdn', 'hsn', 'doc', 'nil', 'exempt', 'summary',
-               'help', 'readme', 'atadj', 'overview']
+               'help', 'readme', 'atadj', 'overview',
+               # GST Portal table numbers that are summaries:
+               'table 12', 'table12', 'table 15', 'table15', 'table 16', 'table16',
+               'hsn wise', 'hsnwise', 'hsn summary', 'hsnsummary',
+               'liability', 'total liability', 'tax liability',
+               ]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -70,12 +77,43 @@ def reconcile_gstr1_vs_3b(file_bytes_list: List[bytes], filenames: List[str] = N
     tax_g1  = sum(g1['totals'][c]  for c in ['igst', 'cgst', 'sgst', 'cess'])
     tax_3b  = sum(g3b['totals'][c] for c in ['igst', 'cgst', 'sgst', 'cess'])
     total_var = round(tax_g1 - tax_3b, 2)
-    pct = round(abs(total_var / tax_3b * 100), 1) if tax_3b else 0
 
-    logger.info(f"G1 tax={tax_g1:,.0f}  3B tax={tax_3b:,.0f}  Var={total_var:,.0f} ({pct}%)")
+    # Variance % = |variance| / min(G1, 3B) × 100
+    denom = min(tax_g1, tax_3b)
+    if denom > 0:
+        pct = round(abs(total_var) / denom * 100, 1)
+        pct_str = f"{pct}%"
+    elif abs(total_var) > 0:
+        pct = float('inf')
+        pct_str = "∞%"
+    else:
+        pct = 0.0
+        pct_str = "0%"
 
-    risk    = _risk(total_var)
+    logger.info(f"G1 tax={tax_g1:,.0f}  3B tax={tax_3b:,.0f}  Var={total_var:,.0f} ({pct_str})")
+
+    risk    = _risk(total_var, tax_g1, tax_3b)
     actions = _actions(total_var, variance)
+
+    # Per-component status
+    HEAD_LABELS = {'igst': 'IGST', 'cgst': 'CGST', 'sgst': 'SGST/UTGST', 'cess': 'Cess'}
+    components = []
+    for c in ['igst', 'cgst', 'sgst', 'cess']:
+        v = variance[c]
+        if abs(v) <= 1:
+            status = '✅ Matched'
+        elif v > 0:
+            status = '🔴 Under-declared'
+        else:
+            status = '🟡 Over-declared'
+        components.append({
+            'head': HEAD_LABELS[c],
+            'gstr1': round(g1['totals'][c], 2),
+            'gstr3b': round(g3b['totals'][c], 2),
+            'variance': round(v, 2),
+            'status': status,
+        })
+
     report  = _excel_report(g1, g3b, variance, risk)
 
     return {
@@ -87,9 +125,11 @@ def reconcile_gstr1_vs_3b(file_bytes_list: List[bytes], filenames: List[str] = N
         'total_tax_g1':    round(tax_g1, 2),
         'total_tax_3b':    round(tax_3b, 2),
         'total_variance':  total_var,
-        'variance_pct':    pct,
+        'variance_pct':    pct if pct != float('inf') else 9999.9,
+        'variance_pct_str': pct_str,
         'risk':            risk,
         'actions':         actions,
+        'components':      components,
         'report_bytes':    report,
     }
 
@@ -101,7 +141,13 @@ def reconcile_gstr1_vs_3b(file_bytes_list: List[bytes], filenames: List[str] = N
 # ── Excel / CSV ────────────────────────────────────────────────
 
 def parse_gstr1(fbytes: bytes, fname: str) -> Dict:
-    """Parse GSTR-1 from .xlsx / .xls / .csv."""
+    """Parse GSTR-1 from .xlsx / .xls / .csv.
+    
+    Strategy to avoid double/triple counting:
+      1. Skip known summary sheets (HSN, Table 12, Table 15, etc.)
+      2. Only sum B2B/B2CL/B2CS/EXP/AT section-level sheets
+      3. Dedup check: if total from sheets > 2x largest sheet, warn and use only largest
+    """
     xls = pd.ExcelFile(io.BytesIO(fbytes))
     logger.info(f"GSTR-1 sheets: {xls.sheet_names}")
 
@@ -137,6 +183,48 @@ def parse_gstr1(fbytes: bytes, fname: str) -> Dict:
 
         logger.info(f"  ✅ '{sn}': {len(df)} rows, "
                     f"tax={totals['igst']+totals['cgst']+totals['sgst']:,.0f}")
+
+    # ── Deduplication check ──
+    # If the total across all sheets is suspiciously high compared to the
+    # largest single section, it likely means summary/HSN sheets leaked through.
+    if len(sections) > 1:
+        section_taxes = []
+        for s in sections:
+            s_tax = s.get('igst', 0) + s.get('cgst', 0) + s.get('sgst', 0)
+            section_taxes.append((s['section'], s_tax, s))
+        
+        max_section_tax = max(t for _, t, _ in section_taxes) if section_taxes else 0
+        total_tax = sum(t for _, t, _ in section_taxes)
+        
+        if max_section_tax > 0 and total_tax > max_section_tax * 1.8:
+            # Likely double/triple counting — use only the section-level sheets
+            # that match known GSTR-1 supply type patterns
+            supply_patterns = ['b2b', 'b2cl', 'b2cs', 'exp', 'at', 'b2ba']
+            supply_sections = [
+                s for _, _, s in section_taxes
+                if any(p in s['section'].lower().replace(' ', '').replace('-', '')
+                       for p in supply_patterns)
+            ]
+            
+            if supply_sections:
+                logger.warning(
+                    f"  ⚠️ DEDUP: Total tax {total_tax:,.0f} is {total_tax/max_section_tax:.1f}x "
+                    f"the largest section ({max_section_tax:,.0f}). "
+                    f"Using only supply-type sheets: {[s['section'] for s in supply_sections]}"
+                )
+                sections = supply_sections
+                grand = {c: 0.0 for c in COMPONENTS}
+                for s in sections:
+                    for c in COMPONENTS:
+                        grand[c] += s.get(c, 0.0)
+            else:
+                # No recognizable supply sections — use single largest
+                largest = max(section_taxes, key=lambda x: x[1])
+                logger.warning(
+                    f"  ⚠️ DEDUP: No supply-type sheets found. Using largest: '{largest[0]}'"
+                )
+                sections = [largest[2]]
+                grand = {c: largest[2].get(c, 0.0) for c in COMPONENTS}
 
     grand = {c: round(v, 2) for c, v in grand.items()}
     return {'sections': sections, 'totals': grand}
@@ -259,7 +347,13 @@ def _parse_gstr1_pdf_grand_total(text: str) -> Dict:
 
 
 def _parse_gstr1_pdf_tables(fbytes: bytes) -> tuple:
-    """Use pdfplumber table extraction as last-resort for GSTR-1 PDF."""
+    """Use pdfplumber table extraction as last-resort for GSTR-1 PDF.
+    
+    IMPORTANT: The GSTN GSTR-1 PDF is a summary document where actual supply
+    data appears in rows labeled "Total" (e.g., "Total 5 Invoice 9,06,195...").
+    We cannot blindly skip "Total" — instead we skip amendment/differential rows
+    and use deduplication to prevent triple-counting.
+    """
     try:
         import pdfplumber
     except ImportError:
@@ -267,6 +361,16 @@ def _parse_gstr1_pdf_tables(fbytes: bytes) -> tuple:
 
     grand    = {c: 0.0 for c in COMPONENTS}
     sections = []
+    seen_amounts = set()  # Dedup: track (taxable, igst, cgst, sgst, cess) tuples
+
+    # Labels that indicate non-supply rows — SKIP these
+    SKIP_LABELS = [
+        'nature of supplies', 'description', 'total taxable', 'integrated tax',
+        'net differential', 'amended amount', 'net amended',
+        'total liability',   # final summary row = duplicate of supply totals
+        'grand total',
+        'liable to collect', 'liable to pay',
+    ]
 
     with pdfplumber.open(io.BytesIO(fbytes)) as pdf:
         for page in pdf.pages:
@@ -286,9 +390,22 @@ def _parse_gstr1_pdf_tables(fbytes: bytes) -> tuple:
                             pass
                     if len(nums) >= 5:
                         label = next((c for c in cells if c and not _is_number_str(c)), 'Unknown')
-                        # Skip header or total rows
-                        if any(x in label.lower() for x in ['nature', 'supply', 'total taxable', 'integrated']):
+                        label_lower = label.lower().strip()
+                        
+                        # Skip header, amendment, and summary rows
+                        if any(x in label_lower for x in SKIP_LABELS):
                             continue
+                        
+                        # Skip if all tax values are zero
+                        tax_tuple = (nums[-5], nums[-4], nums[-3], nums[-2], nums[-1])
+                        if all(v == 0.0 for v in tax_tuple):
+                            continue
+                        
+                        # Skip duplicate amounts (same taxable+tax values = same data)
+                        if tax_tuple in seen_amounts:
+                            continue
+                        seen_amounts.add(tax_tuple)
+                        
                         row_data = {'section': label[:20], 'rows': 0,
                                     'taxable': nums[-5], 'igst': nums[-4],
                                     'cgst':    nums[-3], 'sgst': nums[-2], 'cess': nums[-1]}
@@ -306,7 +423,14 @@ def _parse_gstr1_pdf_tables(fbytes: bytes) -> tuple:
 # ── Excel ──────────────────────────────────────────────────────
 
 def parse_gstr3b(fbytes: bytes, fname: str) -> Dict:
-    """Parse GSTR-3B from .xlsx / .xls — reads ALL rows of Table 3.1."""
+    """Parse GSTR-3B from .xlsx / .xls — reads ALL rows of Table 3.1.
+    
+    Correct comparison:
+      GSTR-1 total outward supplies should be compared with:
+      3.1(a) + 3.1(b) + 3.1(c) + 3.1(e)
+      
+      3.1(d) = inward supplies liable to RCM (NOT outward, exclude).
+    """
     xls = pd.ExcelFile(io.BytesIO(fbytes))
     logger.warning(f"GSTR-3B sheets: {xls.sheet_names}")
 
@@ -314,14 +438,22 @@ def parse_gstr3b(fbytes: bytes, fname: str) -> Dict:
     rows_found = []
 
     # Row identifiers: (label, keywords_that_must_match, keywords_to_exclude)
+    # Include (a), (b), (c), (e) for outward supply comparison
+    # Exclude (d) = inward supplies liable to reverse charge (not outward)
     ROW_DEFS = [
         ('3.1(a)', ['other than zero'], []),
         ('3.1(a)', ['3.1(a)'], []),
         ('3.1(a)', ['3.1 (a)'], []),
         ('3.1(b)', ['zero rated'], ['other than zero']),
         ('3.1(b)', ['3.1(b)'], []),
-        ('3.1(d)', ['reverse charge'], []),
-        ('3.1(d)', ['3.1(d)'], []),
+        ('3.1(c)', ['nil rated'], []),
+        ('3.1(c)', ['exempted'], ['other than']),
+        ('3.1(c)', ['3.1(c)'], []),
+        ('3.1(c)', ['3.1 (c)'], []),
+        ('3.1(e)', ['non-gst'], []),
+        ('3.1(e)', ['non gst'], []),
+        ('3.1(e)', ['3.1(e)'], []),
+        ('3.1(e)', ['3.1 (e)'], []),
     ]
 
     for sn in xls.sheet_names:
@@ -367,7 +499,7 @@ def parse_gstr3b(fbytes: bytes, fname: str) -> Dict:
             rows_found.append((matched_label, totals))
             logger.warning(f"  ✅ {matched_label} found in '{sn}' row {idx}: {totals}")
 
-            # Sum into grand total
+            # Sum into grand total — (a)+(b)+(c)+(e) for outward supplies
             for c in COMPONENTS:
                 grand[c] += totals[c]
 
@@ -387,16 +519,43 @@ def parse_gstr3b(fbytes: bytes, fname: str) -> Dict:
 # ── JSON ───────────────────────────────────────────────────────
 
 def _3b_json(fbytes: bytes) -> Dict:
-    data   = json.loads(fbytes.decode('utf-8'))
-    osup   = (data.get('sup_details', data)).get('osup_det', {})
-    totals = {
-        'taxable': float(osup.get('txval',  0) or 0),
-        'igst':    float(osup.get('iamt',   0) or 0),
-        'cgst':    float(osup.get('camt',   0) or 0),
-        'sgst':    float(osup.get('samt',   0) or 0),
-        'cess':    float(osup.get('csamt',  0) or 0),
-    }
-    return {'totals': {c: round(v, 2) for c, v in totals.items()}, 'row_label': '3.1(a)'}
+    """Parse GSTR-3B JSON — sum 3.1(a)+3.1(b)+3.1(c)+3.1(e) for outward supply comparison."""
+    data = json.loads(fbytes.decode('utf-8'))
+    sup = data.get('sup_details', data)
+    
+    grand = {c: 0.0 for c in COMPONENTS}
+    labels_found = []
+    
+    # 3.1(a) — Outward taxable (other than zero/nil/exempt)
+    osup_det = sup.get('osup_det', {})
+    if osup_det:
+        for c, k in [('taxable','txval'),('igst','iamt'),('cgst','camt'),('sgst','samt'),('cess','csamt')]:
+            grand[c] += float(osup_det.get(k, 0) or 0)
+        labels_found.append('3.1(a)')
+    
+    # 3.1(b) — Zero-rated outward supplies
+    osup_zero = sup.get('osup_zero', {})
+    if osup_zero:
+        for c, k in [('taxable','txval'),('igst','iamt'),('cgst','camt'),('sgst','samt'),('cess','csamt')]:
+            grand[c] += float(osup_zero.get(k, 0) or 0)
+        labels_found.append('3.1(b)')
+    
+    # 3.1(c) — Nil rated, exempted outward supplies
+    osup_nil = sup.get('osup_nil_exmp', {})
+    if osup_nil:
+        for c, k in [('taxable','txval'),('igst','iamt'),('cgst','camt'),('sgst','samt'),('cess','csamt')]:
+            grand[c] += float(osup_nil.get(k, 0) or 0)
+        labels_found.append('3.1(c)')
+    
+    # 3.1(e) — Non-GST outward supplies
+    osup_nongst = sup.get('osup_nongst', {})
+    if osup_nongst:
+        for c, k in [('taxable','txval'),('igst','iamt'),('cgst','camt'),('sgst','samt'),('cess','csamt')]:
+            grand[c] += float(osup_nongst.get(k, 0) or 0)
+        labels_found.append('3.1(e)')
+    
+    row_label = '+'.join(labels_found) if labels_found else '3.1(a)'
+    return {'totals': {c: round(v, 2) for c, v in grand.items()}, 'row_label': row_label}
 
 
 # ── PDF ────────────────────────────────────────────────────────
@@ -441,7 +600,9 @@ def parse_gstr3b_pdf(fbytes: bytes) -> Dict:
     # Rows to SUM for outward liability comparison with GSTR-1:
     # (a) = B2B + B2CS (other than zero/nil)
     # (b) = EXP (zero rated)
-    # (d) = RCM (reverse charge)
+    # (c) = nil rated, exempted
+    # (e) = non-GST outward supplies
+    # EXCLUDE (d) = Inward supplies liable to RCM (NOT outward supplies)
     
     grand = {c: 0.0 for c in COMPONENTS}
     rows_found = []
@@ -476,16 +637,17 @@ def parse_gstr3b_pdf(fbytes: bytes) -> Dict:
                 rows_found.append((label, row_data))
                 logger.warning(f"  ✅ {label}: {row_data}")
                 
-                # Sum (a), (b), (d) for total outward + RCM liability
-                # Skip (c) nil rated and (e) non-GST — they don't generate tax
-                if label in ('3.1(a)', '3.1(b)', '3.1(d)'):
+                # Sum (a)+(b)+(c)+(e) for total outward supply liability
+                # Skip (d) = inward supplies (RCM) — NOT outward
+                if label in ('3.1(a)', '3.1(b)', '3.1(c)', '3.1(e)'):
                     for c in COMPONENTS:
                         grand[c] += row_data[c]
     
     if rows_found:
+        summed = [l for l, _ in rows_found if l != '3.1(d)']
         logger.warning(f"  TOTAL from 3.1: {grand}")
         return {'totals': {c: round(v, 2) for c, v in grand.items()},
-                'row_label': 'Table 3.1 (a+b+d)'}
+                'row_label': 'Table 3.1 (' + '+'.join(summed) + ')'}
 
     # ── Fallback: try the old patterns for just 3.1(a) ──
     logger.warning("  Row-by-row parse failed — trying regex patterns")
@@ -561,8 +723,24 @@ def _parse_gstr3b_pdf_tables(fbytes: bytes) -> Optional[Dict]:
 # ══════════════════════════════════════════════════════════════
 
 def _should_skip(sheet_name: str) -> bool:
+    """Check if a sheet should be skipped (summary/HSN/document sheets)."""
     name = sheet_name.lower().replace(' ', '').replace('-', '').replace('_', '')
-    return any(kw in name for kw in SKIP_SHEETS)
+    # Also check unnormalized name for patterns like 'Table 12'
+    name_lower = sheet_name.lower().strip()
+    
+    if any(kw.replace(' ', '') in name for kw in SKIP_SHEETS):
+        return True
+    
+    # Skip GST Portal table number patterns: "4A", "12", "15", etc.
+    # Keep only supply-type tables: b2b, b2cl, b2cs, exp, at
+    if re.match(r'^table\s*\d', name_lower):
+        # Only keep tables that are supply data (Table 4A = B2B, etc.)
+        supply_tables = ['4a', '4b', '5', '6a', '6b', '6c', '7', '9a', '9b', '9c']
+        table_num = re.sub(r'^table\s*', '', name_lower).strip()
+        if table_num not in supply_tables:
+            return True
+    
+    return False
 
 
 def _read_sheet(xls, sn) -> Optional[pd.DataFrame]:
@@ -645,29 +823,26 @@ def _walk_json_tax(obj, totals):
 #  RISK  &  ACTIONS
 # ══════════════════════════════════════════════════════════════
 
-def _risk(var: float) -> Dict:
+def _risk(var: float, tax_g1: float = 0, tax_3b: float = 0) -> Dict:
     a = abs(var)
-    if a <= 1:
-        return {'level': 'perfect', 'icon': '✅',
-                'heading': 'Perfect Match!',
-                'description': 'GSTR-1 and GSTR-3B match. No action needed.'}
-    if var > 0:  # under-declared in 3B
-        if a > 10000:
-            return {'level': 'high', 'icon': '🔴',
-                    'heading': f'HIGH RISK — Under-declared by ₹{a:,.0f}',
-                    'description': (f'GSTR-1 shows ₹{a:,.0f} more tax. '
-                                    f'ASMT-10 risk. Pay via DRC-03 with 18% interest.')}
-        return {'level': 'medium', 'icon': '🟡',
-                'heading': f'MEDIUM RISK — Shortfall of ₹{a:,.0f}',
-                'description': f'₹{a:,.0f} less declared in 3B. Review and pay via DRC-03.'}
-    else:  # over-declared in 3B
-        if a > 10000:
-            return {'level': 'neutral', 'icon': '💸',
-                    'heading': f'Over-declared by ₹{a:,.0f}',
-                    'description': f'Excess ₹{a:,.0f} paid in 3B. Adjust in next 3B or GSTR-9.'}
-        return {'level': 'low', 'icon': '🟢',
-                'heading': f'Minor excess of ₹{a:,.0f}',
-                'description': f'Small excess paid. Adjust in next return.'}
+    if a == 0:
+        return {'level': 'NO_RISK', 'icon': '✅',
+                'heading': 'NO RISK — Fully Matched',
+                'description': 'GSTR-1 and GSTR-3B match perfectly. No action needed.'}
+    if a <= 1000:
+        return {'level': 'LOW_RISK', 'icon': '🟢',
+                'heading': f'LOW RISK — Rounding difference of ₹{a:,.0f}',
+                'description': f'Variance of ₹{a:,.0f} is within rounding tolerance. No action required.'}
+    if var > 0:  # GSTR-1 > GSTR-3B → under-declared in 3B
+        return {'level': 'HIGH_RISK', 'icon': '🔴',
+                'heading': f'HIGH RISK — Under-declared by ₹{a:,.0f}',
+                'description': (f'GSTR-1 shows ₹{a:,.0f} more tax than GSTR-3B. '
+                                f'ASMT-10 risk. Pay via DRC-03 with 18% interest from due date.')}
+    else:  # GSTR-1 < GSTR-3B → over-declared in 3B
+        return {'level': 'MEDIUM_RISK', 'icon': '🟡',
+                'heading': f'MEDIUM RISK — Over-declared by ₹{a:,.0f}',
+                'description': (f'Excess tax of ₹{a:,.0f} paid in GSTR-3B. '
+                                f'File amendment or adjust in next period.')}
 
 
 def _actions(var: float, comp_var: Dict) -> List[Dict]:
@@ -701,12 +876,14 @@ def _excel_report(g1, g3b, variance, risk) -> bytes:
     buf    = io.BytesIO()
     labels = {'taxable': 'Taxable Value', 'igst': 'IGST',
               'cgst': 'CGST', 'sgst': 'SGST/UTGST', 'cess': 'Cess'}
+    
+    row_label = g3b.get('row_label', 'GSTR-3B')
 
     with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
         rows = [
             {'Component':             labels[c],
              'GSTR-1':                g1['totals'][c],
-             'GSTR-3B 3.1(a)':       g3b['totals'][c],
+             f'GSTR-3B ({row_label})': g3b['totals'][c],
              'Variance (G1−3B)':      variance[c],
              'Status': ('Match'          if abs(variance[c]) <= 1 else
                         'Under-declared' if variance[c] > 0 else 'Over-declared')}
