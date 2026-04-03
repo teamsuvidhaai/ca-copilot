@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Starting up — warming DB connection...")
-    asyncio.create_task(warmup_db())  # ← changed from await to create_task
+    # asyncio.create_task(warmup_db())  # ← changed from await to create_task
     yield
     logger.info("👋 Shutting down...")
 
