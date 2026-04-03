@@ -41,7 +41,7 @@ engine = create_async_engine(
     pool_size=3,          # Keep small for free tier (max 5 total with overflow)
     max_overflow=3,       # Allow 2 extra under load
     pool_timeout=20,      # Seconds to wait for a connection from the pool
-    pool_recycle=180,     # Recycle connections every 3 min (PgBouncer-safe)
+    pool_recycle=55,     # Recycle connections every 3 min (PgBouncer-safe)
     pool_pre_ping=True,   # Test connection before using
     connect_args=connect_args,
 )
