@@ -38,8 +38,8 @@ engine = create_async_engine(
     str(settings.DATABASE_URL),
     echo=False,
     future=True,
-    pool_size=3,          # Keep small for free tier (max 5 total with overflow)
-    max_overflow=2,       # Allow 2 extra under load
+    pool_size=5,          # Keep small for free tier (max 5 total with overflow)
+    max_overflow=10,       # Allow 2 extra under load
     pool_timeout=10,      # Seconds to wait for a connection from the pool
     pool_recycle=180,     # Recycle connections every 3 min (PgBouncer-safe)
     pool_pre_ping=True,   # Test connection before using
