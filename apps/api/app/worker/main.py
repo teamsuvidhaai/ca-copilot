@@ -23,7 +23,15 @@ logger = logging.getLogger("worker")
 # Setup Sync DB
 # Convert async URL to sync (postgresql+asyncpg -> postgresql)
 SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL.replace("+asyncpg", "")
-engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=1,
+    max_overflow=0,
+    pool_recycle=60,
+    pool_timeout=30,
+    connect_args={"connect_timeout": 10},
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_job(db, job_id):
@@ -41,7 +49,7 @@ def run_worker():
             
             if not job:
                 db.close()
-                time.sleep(2)
+                time.sleep(10)
                 continue
             
             logger.info(f"Processing Job: {job.id} ({job.job_type})")
