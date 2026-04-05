@@ -566,6 +566,7 @@ class FinancialInstrumentUpload(Base):
     structured_data = Column(JSONB, nullable=True)                # AI-extracted holdings/transactions/dividends
     journal_entries = Column(JSONB, nullable=True, default=[])    # AI-generated Dr/Cr entries
     journal_entry_count = Column(Integer, default=0)
+    pms_account_id = Column(UUID(as_uuid=True), ForeignKey("pms_accounts.id", ondelete="SET NULL"), nullable=True)  # links PMS uploads to specific account
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -616,6 +617,8 @@ class SecurityMaster(Base):
     name = Column(String(500), nullable=False)                 # canonical name
     exchange = Column(String(20), nullable=True)               # NSE / BSE
     aliases = Column(JSONB, default=[])                        # fuzzy-matched alternate names from providers
+    sector = Column(String(100), nullable=True)                # BSE/NSE sector: Banking, IT, Pharma, etc.
+    market_cap_category = Column(String(20), nullable=True)    # large_cap, mid_cap, small_cap, micro_cap
     fmv_31jan2018 = Column(sa.Numeric(15, 4), nullable=True)   # for Section 112A grandfathering
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -861,3 +864,50 @@ class Rule42Computation(Base):
         Index('idx_rule42_fy', 'client_id', 'financial_year'),
         Index('idx_rule42_period', 'client_id', 'period'),
     )
+
+
+class DepreciationAsset(Base):
+    """Fixed asset with IT Act + Companies Act depreciation parameters.
+    Stores computed year-wise depreciation schedules as JSONB."""
+    __tablename__ = "depreciation_assets"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    firm_id = Column(UUID(as_uuid=True), ForeignKey("firms.id"), nullable=False, index=True)
+
+    # Asset info
+    name = Column(String(255), nullable=False)
+    group_name = Column(String(100), nullable=False)  # Plant & Machinery, Computers, etc.
+    date_acquired = Column(String(10), nullable=False)  # YYYY-MM-DD
+    cost = Column(Float, nullable=False, default=0)
+    residual_value = Column(Float, nullable=False, default=0)
+    financial_year = Column(String(9), nullable=False, default="2025-26")
+
+    # IT Act parameters
+    it_rate = Column(Float, nullable=False, default=15)
+    it_method = Column(String(5), nullable=False, default="WDV")  # WDV or SLM
+
+    # Companies Act parameters
+    co_life = Column(Integer, nullable=False, default=15)  # Useful life in years
+    co_method = Column(String(5), nullable=False, default="SLM")
+
+    # Computed results (JSONB)
+    it_dep_fy = Column(Float, default=0)     # Current FY IT dep
+    co_dep_fy = Column(Float, default=0)     # Current FY Co dep
+    results = Column(JSONB, nullable=True)   # {it_schedule:[], co_schedule:[], deferred_tax:...}
+
+    # Source & status
+    source = Column(String(20), default="manual")  # manual / tally / ledger
+    tally_ledger_name = Column(String(255), nullable=True)
+    status = Column(String(20), default="active")   # active / disposed / draft
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_dep_client', 'client_id'),
+        Index('idx_dep_firm', 'firm_id'),
+        Index('idx_dep_fy', 'client_id', 'financial_year'),
+    )
+

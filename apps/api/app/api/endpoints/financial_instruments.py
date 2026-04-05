@@ -235,11 +235,32 @@ async def _extract_text(file_bytes: bytes, filename: str) -> str:
     """Extract text from PDF/Excel using LlamaParse."""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-    if ext in ("xlsx", "xls", "csv"):
-        # For spreadsheets, decode directly
+    if ext == "csv":
         try:
             return file_bytes.decode("utf-8", errors="replace")
         except Exception:
+            return file_bytes.decode("latin-1", errors="replace")
+
+    if ext in ("xlsx", "xls"):
+        # Parse Excel properly using openpyxl
+        import io
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+            all_text = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                rows = []
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) if c is not None else "" for c in row]
+                    rows.append(",".join(cells))
+                all_text.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
+            wb.close()
+            result = "\n\n".join(all_text)
+            logger.info(f"Excel extraction: {len(result)} chars from {len(wb.sheetnames)} sheets")
+            return result
+        except Exception as e:
+            logger.error(f"openpyxl failed: {e}, falling back to raw decode")
             return file_bytes.decode("latin-1", errors="replace")
 
     # PDF — use LlamaParse
@@ -288,6 +309,12 @@ async def _structure_with_openai(text: str, instrument_type: str) -> dict:
     prompts = {"demat": DEMAT_PROMPT, "mutual_fund": MF_PROMPT, "pms": PMS_PROMPT}
     prompt = prompts.get(instrument_type, DEMAT_PROMPT)
 
+    # Check if text is too large and needs chunking
+    estimated_tokens = len(text) // 4  # rough: 1 token ≈ 4 chars
+    if estimated_tokens > 20000:
+        logger.info(f"Large file detected (~{estimated_tokens} tokens). Using chunked processing.")
+        return await _structure_chunked(text, instrument_type, prompt)
+
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     response = await client.chat.completions.create(
         model="gpt-4o",
@@ -302,21 +329,161 @@ async def _structure_with_openai(text: str, instrument_type: str) -> dict:
     return json.loads(response.choices[0].message.content)
 
 
+async def _structure_chunked(text: str, instrument_type: str, prompt: str) -> dict:
+    """Process large files by splitting into row-based chunks and merging results."""
+    import asyncio
+
+    lines = text.split("\n")
+
+    # Find the header (first non-empty line or sheet header)
+    header_lines = []
+    data_lines = []
+    in_header = True
+    for line in lines:
+        stripped = line.strip()
+        if in_header:
+            header_lines.append(line)
+            # Once we hit a line with commas (data row), switch to data mode
+            if stripped.count(",") >= 2 and not stripped.startswith("---"):
+                in_header = False
+                # The last header line is actually the first data row's header
+                # Keep it as header for each chunk
+        else:
+            data_lines.append(line)
+
+    # If no clear header/data split, just split by lines
+    if len(data_lines) == 0:
+        header_lines = lines[:2]  # first 2 lines as header
+        data_lines = lines[2:]
+
+    header_text = "\n".join(header_lines)
+    CHUNK_SIZE = 300  # rows per chunk (keeps each ~12K tokens, well under 30K TPM)
+
+    chunks = []
+    for i in range(0, len(data_lines), CHUNK_SIZE):
+        chunk_rows = data_lines[i:i + CHUNK_SIZE]
+        chunk_text = header_text + "\n" + "\n".join(chunk_rows)
+        chunks.append(chunk_text)
+
+    logger.info(f"Split into {len(chunks)} chunks ({len(data_lines)} data rows, {CHUNK_SIZE} per chunk)")
+
+    client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    async def process_chunk(chunk_text: str, chunk_idx: int) -> dict:
+        chunk_prompt = prompt + f"\n\nNOTE: This is chunk {chunk_idx + 1} of {len(chunks)}. Extract all data from this chunk."
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": chunk_prompt},
+                        {"role": "user", "content": chunk_text},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    max_tokens=16000,
+                )
+                result = json.loads(response.choices[0].message.content)
+                logger.info(f"  Chunk {chunk_idx + 1}/{len(chunks)}: OK")
+                return result
+            except Exception as e:
+                wait_time = 30 * (attempt + 1)  # 30s, 60s, 90s
+                logger.warning(f"  Chunk {chunk_idx + 1} attempt {attempt + 1} failed: {e}. Retry in {wait_time}s")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"  Chunk {chunk_idx + 1}/{len(chunks)} failed after {max_retries} retries")
+                    return {}
+
+    # Process chunks sequentially (1 at a time) with 30s gap to respect TPM limits
+    all_results = []
+    for i, chunk_text in enumerate(chunks):
+        result = await process_chunk(chunk_text, i)
+        all_results.append(result)
+        if i < len(chunks) - 1:
+            await asyncio.sleep(30)  # 30s gap between chunks to stay under 30K TPM
+
+    # Merge all chunk results
+    merged = _merge_structured_results(all_results, instrument_type)
+    logger.info(f"Merged {len(all_results)} chunks → {sum(len(v) for v in merged.values() if isinstance(v, list))} total items")
+    return merged
+
+
+def _merge_structured_results(results: list, instrument_type: str) -> dict:
+    """Merge structured data from multiple chunks into one."""
+    merged = {}
+    list_keys = {"holdings", "transactions", "dividends", "fees", "funds"}
+
+    for r in results:
+        if not r:
+            continue
+        for key, value in r.items():
+            if key in list_keys and isinstance(value, list):
+                merged.setdefault(key, []).extend(value)
+            elif key == "capital_gains_summary" and isinstance(value, dict):
+                existing = merged.get("capital_gains_summary", {})
+                for k, v in value.items():
+                    if v is not None:
+                        existing[k] = (existing.get(k) or 0) + (v or 0)
+                merged["capital_gains_summary"] = existing
+            elif key not in merged and value is not None:
+                merged[key] = value  # keep first non-null scalar (e.g., dp_id, client_name)
+
+    return merged
+
+
 async def _generate_journal_entries(structured_data: dict) -> dict:
-    """Generate journal entries from structured instrument data."""
+    """Generate journal entries from structured instrument data. Chunks large datasets."""
+    import asyncio
+
+    data_str = json.dumps(structured_data, default=str)
+    estimated_tokens = len(data_str) // 4
+
+    # If small enough, process in one shot
+    if estimated_tokens <= 20000:
+        return await _generate_journal_entries_single(data_str)
+
+    # Large dataset — chunk by transactions
+    logger.info(f"Large structured data (~{estimated_tokens} tokens). Chunking journal generation.")
+    transactions = structured_data.get("transactions", [])
+    BATCH = 100
+    all_entries = []
+
+    for i in range(0, max(len(transactions), 1), BATCH):
+        chunk_data = {k: v for k, v in structured_data.items() if k != "transactions"}
+        chunk_data["transactions"] = transactions[i:i + BATCH]
+        chunk_str = json.dumps(chunk_data, default=str)
+
+        try:
+            result = await _generate_journal_entries_single(chunk_str)
+            entries = result.get("journal_entries", [])
+            all_entries.extend(entries)
+            logger.info(f"  JE batch {i // BATCH + 1}: {len(entries)} entries")
+        except Exception as e:
+            logger.error(f"  JE batch {i // BATCH + 1} failed: {e}")
+
+        if i + BATCH < len(transactions):
+            await asyncio.sleep(2)
+
+    validated = _validate_journal_entries(all_entries)
+    return {"journal_entries": validated}
+
+
+async def _generate_journal_entries_single(data_str: str) -> dict:
+    """Generate journal entries for a single chunk."""
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     response = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": JOURNAL_ENTRY_PROMPT},
-            {"role": "user", "content": json.dumps(structured_data, default=str)},
+            {"role": "user", "content": data_str},
         ],
         response_format={"type": "json_object"},
         temperature=0.1,
-        max_tokens=8000,
+        max_tokens=16000,
     )
     result = json.loads(response.choices[0].message.content)
-    # Validate entries before returning
     result["journal_entries"] = _validate_journal_entries(result.get("journal_entries", []))
     return result
 
@@ -397,33 +564,54 @@ async def _process_upload(upload_id: str, file_bytes: bytes, filename: str, inst
     """Background: extract → structure → journal entries. Writes progress to DB."""
     async with AsyncSessionLocal() as db:
         try:
-            # Update status: extracting
             row = (await db.execute(select(FinancialInstrumentUpload).where(FinancialInstrumentUpload.id == upload_id))).scalar_one()
             row.status = "extracting"
             await db.commit()
 
             _upload_to_supabase(file_bytes, upload_id, filename)
 
-            raw_text = await _extract_text(file_bytes, filename)
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            is_demat_excel = instrument_type.startswith("demat_") and ext in ("xlsx", "xls")
 
-            # Update status: structuring
-            row.status = "structuring"
-            row.raw_text = raw_text[:2000]
-            await db.commit()
+            if is_demat_excel:
+                # ═══ DIRECT PARSING — No AI needed ═══
+                from app.api.endpoints.demat_parser import parse_demat_excel
+                row.status = "structuring"
+                await db.commit()
 
-            structured = await _structure_with_openai(raw_text, instrument_type)
-            row.structured_data = structured
-            row.status = "generating_entries"
-            await db.commit()
+                structured, entries = parse_demat_excel(file_bytes, filename, instrument_type)
+                row.structured_data = structured
+                row.raw_text = f"[Direct parsed — {len(structured.get('transactions', structured.get('holdings', [])))} items]"
+                row.status = "generating_entries"
+                await db.commit()
 
-            journal = await _generate_journal_entries(structured)
-            entries = journal.get("journal_entries", [])
-            row.journal_entries = entries
-            row.journal_entry_count = len(entries)
-            row.status = "completed"
-            await db.commit()
+                row.journal_entries = entries
+                row.journal_entry_count = len(entries)
+                row.status = "completed"
+                await db.commit()
 
-            logger.info(f"✅ FI Upload {upload_id}: {len(entries)} journal entries")
+                logger.info(f"✅ FI Upload {upload_id} (direct): {len(entries)} journal entries")
+            else:
+                # ═══ AI PIPELINE — for PDFs and other formats ═══
+                raw_text = await _extract_text(file_bytes, filename)
+                row.status = "structuring"
+                row.raw_text = raw_text[:2000]
+                await db.commit()
+
+                base_type = instrument_type.split('_')[0] if instrument_type.startswith('demat_') else instrument_type
+                structured = await _structure_with_openai(raw_text, base_type)
+                row.structured_data = structured
+                row.status = "generating_entries"
+                await db.commit()
+
+                journal = await _generate_journal_entries(structured)
+                entries = journal.get("journal_entries", [])
+                row.journal_entries = entries
+                row.journal_entry_count = len(entries)
+                row.status = "completed"
+                await db.commit()
+
+                logger.info(f"✅ FI Upload {upload_id} (AI): {len(entries)} journal entries")
 
         except Exception as e:
             logger.error(f"❌ FI Upload {upload_id} failed: {e}")
@@ -446,8 +634,9 @@ async def upload_statement(
 ) -> Any:
     """Upload a Demat/MF/PMS statement for AI processing."""
 
-    if instrument_type not in ("demat", "mutual_fund", "pms"):
-        raise HTTPException(400, "instrument_type must be: demat, mutual_fund, or pms")
+    valid_types = ("demat", "mutual_fund", "pms", "demat_holdings", "demat_taxpnl", "demat_tradebook")
+    if instrument_type not in valid_types:
+        raise HTTPException(400, f"instrument_type must be one of: {', '.join(valid_types)}")
 
     if not file.filename:
         raise HTTPException(400, "No file provided")
@@ -592,6 +781,7 @@ async def list_uploads(
             "status": r.status,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "journal_entry_count": r.journal_entry_count or 0,
+            "pms_account_id": str(r.pms_account_id) if r.pms_account_id else None,
         }
         for r in rows
     ]

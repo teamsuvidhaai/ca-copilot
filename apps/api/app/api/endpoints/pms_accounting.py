@@ -533,11 +533,28 @@ async def get_stock_register(
     # Build per-security register
     securities = {}
 
+    # Pre-fetch security metadata (sector, market cap) from SecurityMaster
+    security_ids = list(set(str(lot.security_id) for lot in lots if lot.security_id))
+    sec_meta_map = {}  # security_id → {sector, market_cap_category}
+    if security_ids:
+        sec_rows = (await db.execute(
+            select(SecurityMaster).where(SecurityMaster.id.in_(security_ids))
+        )).scalars().all()
+        for s in sec_rows:
+            sec_meta_map[str(s.id)] = {
+                "sector": s.sector,
+                "market_cap_category": s.market_cap_category,
+            }
+
     for lot in lots:
         name = lot.security_name
         if name not in securities:
+            # Look up sector/market_cap from pre-fetched metadata
+            meta = sec_meta_map.get(str(lot.security_id), {}) if lot.security_id else {}
             securities[name] = {
                 "security_name": name,
+                "sector": meta.get("sector"),
+                "market_cap_category": meta.get("market_cap_category"),
                 "opening": {"qty": 0, "value": 0},
                 "purchases": [],
                 "sales": [],
@@ -1633,6 +1650,7 @@ async def upload_pms_statement(
         client_id=client_id,
         user_id=str(current_user.id),
         instrument_type=f"pms_{statement_type}",  # pms_transaction, pms_dividend, pms_expenses
+        pms_account_id=pms_account_id,
         filename=file.filename,
         file_hash=file_hash,
         status="processing",
