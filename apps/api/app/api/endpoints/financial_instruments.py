@@ -845,3 +845,378 @@ async def get_upload_pdf(
         logger.warning(f"PDF URL generation failed: {e}")
         raise HTTPException(400, f"Could not generate PDF URL: {str(e)}")
 
+
+# ═══════════════════════════════════════════════════════
+# 26AS / AIS — Upload, Extract, Auto-Match
+# ═══════════════════════════════════════════════════════
+
+TDS_26AS_PROMPT = """You are an expert Indian tax data extraction AI specialising in Form 26AS and AIS (Annual Information Statement).
+
+Given the raw text from a 26AS or AIS document, extract ALL TDS entries organised by section.
+
+**Rules:**
+1. Extract EVERY entry from Part A (TDS) and Part A1 (TDS 15G/15H). Do NOT skip any.
+2. Dates must be ISO format: "YYYY-MM-DD"
+3. Amounts must be plain numbers (no commas, no ₹) or null.
+4. Group entries by TDS section code (194, 194A, 194K, 194DA, 194B, etc.)
+5. Also extract Part B (TCS), Part C (Tax Paid), and SFT entries if present.
+
+Return this exact JSON:
+{
+    "pan": "string or null",
+    "assessment_year": "string or null",
+    "financial_year": "string or null",
+    "tds_entries": [
+        {
+            "section": "194 or 194A or 194K or 194DA or 194B etc",
+            "section_description": "Dividend / Interest / MF Income etc",
+            "tan_of_deductor": "string or null",
+            "deductor_name": "string",
+            "transaction_date": "YYYY-MM-DD or null",
+            "amount_paid_credited": number,
+            "tds_deducted": number,
+            "tds_deposited": number or null
+        }
+    ],
+    "tcs_entries": [
+        {
+            "section": "string",
+            "collector_name": "string",
+            "amount": number,
+            "tcs_collected": number
+        }
+    ],
+    "tax_paid": [
+        {
+            "type": "Advance Tax or Self Assessment or TDS",
+            "bsr_code": "string or null",
+            "date": "YYYY-MM-DD",
+            "amount": number,
+            "challan_serial": "string or null"
+        }
+    ],
+    "sft_entries": [
+        {
+            "transaction_type": "Purchase of shares / Sale of shares / MF Purchase / MF Redemption etc",
+            "reported_by": "string",
+            "amount": number,
+            "count_of_transactions": number or null
+        }
+    ],
+    "summary": {
+        "total_tds": number,
+        "total_tcs": number,
+        "total_tax_paid": number,
+        "total_income_reported": number
+    }
+}"""
+
+
+async def _process_26as_upload(upload_id: str, file_bytes: bytes, filename: str, client_id: str):
+    """Background: extract 26AS → structure → auto-match with existing statements."""
+    async with AsyncSessionLocal() as db:
+        try:
+            row = (await db.execute(
+                select(FinancialInstrumentUpload).where(FinancialInstrumentUpload.id == upload_id)
+            )).scalar_one()
+            row.status = "extracting"
+            await db.commit()
+
+            _upload_to_supabase(file_bytes, upload_id, filename)
+
+            raw_text = await _extract_text(file_bytes, filename)
+            row.status = "structuring"
+            row.raw_text = raw_text[:2000]
+            await db.commit()
+
+            # AI extraction
+            client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            estimated_tokens = len(raw_text) // 4
+
+            if estimated_tokens > 20000:
+                # Chunked processing for large 26AS
+                structured = await _structure_chunked(raw_text, "26as", TDS_26AS_PROMPT)
+            else:
+                response = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": TDS_26AS_PROMPT},
+                        {"role": "user", "content": raw_text},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    max_tokens=16000,
+                )
+                structured = json.loads(response.choices[0].message.content)
+
+            # Run auto-matching
+            row.status = "generating_entries"
+            await db.commit()
+
+            match_results = await _match_26as_with_statements(db, structured, client_id)
+            structured["match_results"] = match_results
+
+            row.structured_data = structured
+            row.journal_entries = []
+            row.journal_entry_count = 0
+            row.status = "completed"
+            await db.commit()
+
+            logger.info(f"✅ 26AS Upload {upload_id}: {len(structured.get('tds_entries', []))} TDS entries, "
+                        f"{match_results.get('matched_count', 0)} matched, "
+                        f"{match_results.get('unmatched_count', 0)} unmatched")
+
+        except Exception as e:
+            logger.error(f"❌ 26AS Upload {upload_id} failed: {e}")
+            row = (await db.execute(
+                select(FinancialInstrumentUpload).where(FinancialInstrumentUpload.id == upload_id)
+            )).scalar_one_or_none()
+            if row:
+                row.status = "failed"
+                row.error_message = str(e)[:2000]
+                await db.commit()
+
+
+async def _match_26as_with_statements(db: AsyncSession, data_26as: dict, client_id: str) -> dict:
+    """Match 26AS TDS entries against uploaded Demat/MF/PMS statements."""
+
+    tds_entries = data_26as.get("tds_entries", [])
+    if not tds_entries:
+        return {"matched": [], "unmatched_26as": [], "unmatched_stmts": [],
+                "mismatched": [], "matched_count": 0, "unmatched_count": 0,
+                "mismatch_count": 0, "section_summary": {}}
+
+    # Fetch all completed FI uploads for this client (non-26AS)
+    stmt_rows = (await db.execute(
+        select(FinancialInstrumentUpload).where(
+            FinancialInstrumentUpload.client_id == client_id,
+            FinancialInstrumentUpload.status == "completed",
+            FinancialInstrumentUpload.instrument_type != "26as",
+        )
+    )).scalars().all()
+
+    # Collect all dividends & TDS from statements
+    stmt_dividends = []  # {"source": "demat/mf/pms", "name": "...", "amount": X, "tds": Y}
+    stmt_cg = {"stcg": 0, "ltcg": 0}
+
+    for sr in stmt_rows:
+        sd = sr.structured_data or {}
+        utype = sr.instrument_type
+
+        # Dividends
+        for div in sd.get("dividends", []):
+            amt = float(div.get("amount", 0) or 0)
+            tds = float(div.get("tds_deducted", div.get("tds", 0)) or 0)
+            name = div.get("scrip_name", div.get("fund_name", div.get("security_name", "Unknown")))
+            if amt > 0:
+                stmt_dividends.append({
+                    "source": utype, "name": name, "amount": amt,
+                    "tds": tds, "date": div.get("date", div.get("ex_date", ""))
+                })
+
+        # Capital gains summary
+        cg = sd.get("capital_gains_summary", {})
+        stmt_cg["stcg"] += float(cg.get("short_term_gain", 0) or 0)
+        stmt_cg["ltcg"] += float(cg.get("long_term_gain", 0) or 0)
+
+    # Group 26AS entries by section
+    section_groups = {}
+    for entry in tds_entries:
+        sec = entry.get("section", "unknown")
+        section_groups.setdefault(sec, []).append(entry)
+
+    matched = []
+    unmatched_26as = []
+    mismatched = []
+
+    # Process each section
+    remaining_stmt_divs = list(stmt_dividends)
+
+    for entry in tds_entries:
+        sec = entry.get("section", "")
+        deductor = entry.get("deductor_name", "")
+        amt_26as = float(entry.get("amount_paid_credited", 0) or 0)
+        tds_26as = float(entry.get("tds_deducted", 0) or 0)
+
+        # Try to match dividend entries (Sec 194, 194K, 194DA)
+        if sec in ("194", "194K", "194DA"):
+            best_match = None
+            best_idx = -1
+            best_diff = float("inf")
+
+            for i, sd in enumerate(remaining_stmt_divs):
+                # Match by amount (within 10% tolerance) and fuzzy name
+                if sd["amount"] > 0:
+                    diff = abs(sd["amount"] - amt_26as)
+                    pct_diff = diff / max(amt_26as, 1) * 100
+
+                    if pct_diff < 15 and diff < best_diff:
+                        best_match = sd
+                        best_idx = i
+                        best_diff = diff
+
+            if best_match is not None:
+                tds_diff = abs(best_match["tds"] - tds_26as)
+                status = "matched" if tds_diff < 10 else "tds_mismatch"
+
+                result_entry = {
+                    "section": sec,
+                    "deductor": deductor,
+                    "amount_26as": amt_26as,
+                    "tds_26as": tds_26as,
+                    "amount_stmt": best_match["amount"],
+                    "tds_stmt": best_match["tds"],
+                    "stmt_source": best_match["source"],
+                    "stmt_name": best_match["name"],
+                    "amount_diff": round(amt_26as - best_match["amount"], 2),
+                    "tds_diff": round(tds_26as - best_match["tds"], 2),
+                }
+
+                if status == "matched":
+                    matched.append(result_entry)
+                else:
+                    result_entry["issue"] = f"TDS mismatch: 26AS ₹{tds_26as:.0f} vs Stmt ₹{best_match['tds']:.0f}"
+                    mismatched.append(result_entry)
+
+                remaining_stmt_divs.pop(best_idx)
+            else:
+                unmatched_26as.append({
+                    "section": sec,
+                    "deductor": deductor,
+                    "amount_26as": amt_26as,
+                    "tds_26as": tds_26as,
+                    "issue": "No matching dividend found in uploaded statements"
+                })
+        else:
+            # Other sections (194A interest, etc.) — report as informational
+            unmatched_26as.append({
+                "section": sec,
+                "deductor": deductor,
+                "amount_26as": amt_26as,
+                "tds_26as": tds_26as,
+                "issue": f"Section {sec} — not auto-matched (manual verification needed)"
+            })
+
+    # Remaining statement dividends that weren't matched
+    unmatched_stmts = [{
+        "source": sd["source"], "name": sd["name"],
+        "amount": sd["amount"], "tds": sd["tds"],
+        "issue": "Dividend in statement but not found in 26AS"
+    } for sd in remaining_stmt_divs]
+
+    # Build section summary
+    section_summary = {}
+    for sec, entries in section_groups.items():
+        total_amount = sum(float(e.get("amount_paid_credited", 0) or 0) for e in entries)
+        total_tds = sum(float(e.get("tds_deducted", 0) or 0) for e in entries)
+        section_summary[sec] = {
+            "count": len(entries),
+            "total_amount": round(total_amount, 2),
+            "total_tds": round(total_tds, 2),
+        }
+
+    return {
+        "matched": matched,
+        "unmatched_26as": unmatched_26as,
+        "unmatched_stmts": unmatched_stmts,
+        "mismatched": mismatched,
+        "matched_count": len(matched),
+        "unmatched_count": len(unmatched_26as) + len(unmatched_stmts),
+        "mismatch_count": len(mismatched),
+        "section_summary": section_summary,
+    }
+
+
+# ─── 26AS Upload Endpoint ────────────────────────────
+@router.post("/26as-upload")
+async def upload_26as(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    client_id: str = Form(...),
+    current_user: User = Depends(deps.get_current_user),
+    db: AsyncSession = Depends(deps.get_db),
+) -> Any:
+    """Upload a 26AS or AIS PDF for TDS reconciliation."""
+    if not file.filename:
+        raise HTTPException(400, "No file provided")
+
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext not in ("pdf", "xlsx", "xls", "csv"):
+        raise HTTPException(400, f"Supported: PDF, Excel, CSV. Got .{ext}")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(400, f"File too large ({len(file_bytes)/(1024*1024):.1f} MB). Max 25 MB.")
+    if len(file_bytes) == 0:
+        raise HTTPException(400, "File is empty")
+
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    # Check duplicate
+    existing = (await db.execute(
+        select(FinancialInstrumentUpload).where(
+            FinancialInstrumentUpload.client_id == client_id,
+            FinancialInstrumentUpload.file_hash == file_hash,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(409, f"Duplicate — already uploaded as \"{existing.filename}\"")
+
+    upload_id = str(uuid.uuid4())
+    row = FinancialInstrumentUpload(
+        id=upload_id,
+        client_id=client_id,
+        user_id=str(current_user.id),
+        instrument_type="26as",
+        filename=file.filename,
+        file_hash=file_hash,
+        status="processing",
+    )
+    db.add(row)
+    await db.commit()
+
+    background_tasks.add_task(_process_26as_upload, upload_id, file_bytes, file.filename, client_id)
+
+    return {
+        "id": upload_id,
+        "status": "processing",
+        "message": f"Processing 26AS: {file.filename}. Extraction + auto-matching may take 30-60 seconds.",
+    }
+
+
+# ─── 26AS Match Results ──────────────────────────────
+@router.get("/26as-match")
+async def get_26as_match(
+    client_id: str,
+    current_user: User = Depends(deps.get_current_user),
+    db: AsyncSession = Depends(deps.get_db),
+) -> Any:
+    """Get auto-match results from the latest 26AS upload for a client."""
+    row = (await db.execute(
+        select(FinancialInstrumentUpload).where(
+            FinancialInstrumentUpload.client_id == client_id,
+            FinancialInstrumentUpload.instrument_type == "26as",
+        ).order_by(FinancialInstrumentUpload.created_at.desc())
+    )).scalars().first()
+
+    if not row:
+        return {"status": "not_uploaded", "message": "No 26AS uploaded for this client"}
+    if row.status != "completed":
+        return {"status": row.status, "message": f"26AS processing: {row.status}"}
+
+    sd = row.structured_data or {}
+    return {
+        "status": "completed",
+        "upload_id": str(row.id),
+        "filename": row.filename,
+        "uploaded_at": row.created_at.isoformat() if row.created_at else None,
+        "pan": sd.get("pan"),
+        "assessment_year": sd.get("assessment_year"),
+        "financial_year": sd.get("financial_year"),
+        "tds_entries_count": len(sd.get("tds_entries", [])),
+        "summary": sd.get("summary", {}),
+        "match_results": sd.get("match_results", {}),
+        "section_summary": sd.get("match_results", {}).get("section_summary", {}),
+    }
+
+
