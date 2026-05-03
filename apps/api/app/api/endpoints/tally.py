@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func, desc, asc, or_
+from sqlalchemy import func, desc, asc, or_, text
 
 from app.api import deps
 from app.models.models import Ledger, Voucher, VoucherEntry, VoucherInventoryEntry, User
@@ -115,7 +115,29 @@ async def ledger_stats(
         select(func.count(func.distinct(Ledger.company_name)))
     )).scalar() or 0
 
-    return {"total_ledgers": total, "with_gstin": with_gstin, "groups": groups, "companies": companies}
+    # Stock items count (distinct stock item names from inventory entries)
+    items_q = select(func.count(func.distinct(VoucherInventoryEntry.stock_item_name)))
+    if company_name:
+        items_q = items_q.where(VoucherInventoryEntry.company_name == company_name)
+    total_items = (await db.execute(items_q)).scalar() or 0
+
+    # Cost centres count (ledgers under Cost Centre parent group)
+    cc_q = select(func.count(Ledger.id)).where(
+        Ledger.parent.in_(['Cost Centre', 'Cost Centres', 'Primary Cost Centre'])
+    )
+    if company_name:
+        cc_q = cc_q.where(Ledger.company_name == company_name)
+    total_cost_centres = (await db.execute(cc_q)).scalar() or 0
+
+    return {
+        "total_ledgers": total,
+        "with_gstin": with_gstin,
+        "total_groups": groups,
+        "groups": groups,
+        "companies": companies,
+        "total_items": total_items,
+        "total_cost_centres": total_cost_centres,
+    }
 
 
 # ──────────────────────────────────────────
@@ -420,6 +442,372 @@ async def inventory_stats(
         "unique_items": unique_items,
         "unique_hsn_codes": unique_hsn,
         "top_items": top_items,
+    }
+
+
+@router.get("/mis-reports")
+async def mis_reports(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+    company_name: Optional[str] = None,
+) -> Any:
+    """
+    MIS Reports — Profitability, Sales, Cost & Inventory analysis
+    computed from synced Tally ledgers, vouchers, and inventory entries.
+    """
+    if not company_name:
+        raise HTTPException(400, "company_name is required")
+
+    # ─── 1. PROFITABILITY ANALYSIS ────────────────────────
+    # Revenue groups: Sales Accounts
+    revenue_groups = ['Sales Accounts', 'Sales Account']
+    rev_q = (
+        select(func.coalesce(func.sum(Ledger.closing_balance), 0))
+        .where(Ledger.company_name == company_name, Ledger.parent.in_(revenue_groups))
+    )
+    total_revenue = float((await db.execute(rev_q)).scalar() or 0)
+    # Tally: positive closing_balance = Credit (revenue)
+    total_revenue = abs(total_revenue)
+
+    # COGS / Direct expenses
+    direct_groups = ['Purchase Accounts', 'Purchase Account', 'Direct Expenses', 'Stock-in-Hand']
+    cogs_q = (
+        select(func.coalesce(func.sum(Ledger.closing_balance), 0))
+        .where(Ledger.company_name == company_name, Ledger.parent.in_(direct_groups))
+    )
+    total_cogs = abs(float((await db.execute(cogs_q)).scalar() or 0))
+
+    # Indirect expenses
+    indirect_groups = ['Indirect Expenses', 'Administrative Expenses', 'Selling Expenses',
+                       'Indirect Expenses (Mfg.)', 'Misc. Expenses (ASSET)']
+    indirect_q = (
+        select(func.coalesce(func.sum(Ledger.closing_balance), 0))
+        .where(Ledger.company_name == company_name, Ledger.parent.in_(indirect_groups))
+    )
+    total_indirect = abs(float((await db.execute(indirect_q)).scalar() or 0))
+
+    gross_profit = total_revenue - total_cogs
+    net_profit = gross_profit - total_indirect
+    gross_margin = (gross_profit / total_revenue * 100) if total_revenue else 0
+    net_margin = (net_profit / total_revenue * 100) if total_revenue else 0
+
+    # ─── 2. SALES ANALYSIS ────────────────────────────────
+    # Monthly sales trend
+    month_col = func.substr(Voucher.date, 1, 6)
+    monthly_sales_q = (
+        select(
+            month_col.label("month"),
+            func.count(Voucher.id).label("count"),
+            func.sum(func.abs(Voucher.amount)).label("total")
+        )
+        .where(Voucher.company_name == company_name, Voucher.voucher_type == "Sales")
+        .group_by(month_col)
+        .order_by(month_col)
+    )
+    monthly_result = await db.execute(monthly_sales_q)
+    monthly_sales = [
+        {"month": row[0], "count": row[1], "total": float(row[2]) if row[2] else 0}
+        for row in monthly_result
+    ]
+
+    # Top 10 customers by sales amount
+    top_customers_q = (
+        select(
+            Voucher.party_name,
+            func.count(Voucher.id).label("invoice_count"),
+            func.sum(func.abs(Voucher.amount)).label("total")
+        )
+        .where(Voucher.company_name == company_name, Voucher.voucher_type == "Sales",
+               Voucher.party_name != None, Voucher.party_name != "")
+        .group_by(Voucher.party_name)
+        .order_by(desc("total"))
+        .limit(10)
+    )
+    top_cust_result = await db.execute(top_customers_q)
+    top_customers = [
+        {"name": row[0], "invoice_count": row[1], "total": float(row[2]) if row[2] else 0}
+        for row in top_cust_result
+    ]
+
+    # Total sales stats
+    sales_total_q = (
+        select(
+            func.count(Voucher.id),
+            func.sum(func.abs(Voucher.amount))
+        )
+        .where(Voucher.company_name == company_name, Voucher.voucher_type == "Sales")
+    )
+    st_res = (await db.execute(sales_total_q)).first()
+    total_sales_count = st_res[0] or 0
+    total_sales_amount = float(st_res[1]) if st_res[1] else 0
+
+    # ─── 3. COST ANALYSIS ─────────────────────────────────
+    # Expense breakdown by ledger group (parent)
+    expense_parents = direct_groups + indirect_groups
+    expense_cat_q = (
+        select(
+            Ledger.parent,
+            func.count(Ledger.id).label("ledger_count"),
+            func.sum(func.abs(Ledger.closing_balance)).label("total")
+        )
+        .where(Ledger.company_name == company_name, Ledger.parent.in_(expense_parents))
+        .group_by(Ledger.parent)
+        .order_by(desc("total"))
+    )
+    exp_cat_result = await db.execute(expense_cat_q)
+    expense_categories = [
+        {"category": row[0] or "Other", "ledger_count": row[1], "total": float(row[2]) if row[2] else 0}
+        for row in exp_cat_result
+    ]
+
+    # Top 10 individual expense ledgers
+    top_expenses_q = (
+        select(
+            Ledger.name,
+            Ledger.parent,
+            func.abs(Ledger.closing_balance).label("amount")
+        )
+        .where(
+            Ledger.company_name == company_name,
+            Ledger.parent.in_(expense_parents),
+            Ledger.closing_balance != 0
+        )
+        .order_by(desc("amount"))
+        .limit(10)
+    )
+    top_exp_result = await db.execute(top_expenses_q)
+    top_expenses = [
+        {"name": row[0], "group": row[1] or "", "amount": float(row[2]) if row[2] else 0}
+        for row in top_exp_result
+    ]
+
+    # Monthly purchase/expense trend
+    pmonth_col = func.substr(Voucher.date, 1, 6)
+    monthly_purchase_q = (
+        select(
+            pmonth_col.label("month"),
+            func.count(Voucher.id).label("count"),
+            func.sum(func.abs(Voucher.amount)).label("total")
+        )
+        .where(Voucher.company_name == company_name, Voucher.voucher_type == "Purchase")
+        .group_by(pmonth_col)
+        .order_by(pmonth_col)
+    )
+    monthly_purch_result = await db.execute(monthly_purchase_q)
+    monthly_purchases = [
+        {"month": row[0], "count": row[1], "total": float(row[2]) if row[2] else 0}
+        for row in monthly_purch_result
+    ]
+
+    # ─── 4. INVENTORY ANALYSIS ────────────────────────────
+    # Top 10 stock items by total sales value
+    top_items_sales_q = (
+        select(
+            VoucherInventoryEntry.stock_item_name,
+            func.sum(VoucherInventoryEntry.quantity).label("total_qty"),
+            func.sum(func.abs(VoucherInventoryEntry.amount)).label("total_value"),
+            func.count(VoucherInventoryEntry.id).label("txn_count")
+        )
+        .where(
+            VoucherInventoryEntry.company_name == company_name,
+            VoucherInventoryEntry.voucher_type == "Sales"
+        )
+        .group_by(VoucherInventoryEntry.stock_item_name)
+        .order_by(desc("total_value"))
+        .limit(10)
+    )
+    top_items_result = await db.execute(top_items_sales_q)
+    top_items_by_sales = [
+        {
+            "name": row[0], "total_qty": float(row[1]) if row[1] else 0,
+            "total_value": float(row[2]) if row[2] else 0, "txn_count": row[3]
+        }
+        for row in top_items_result
+    ]
+
+    # Godown/Warehouse analysis
+    godown_q = (
+        select(
+            VoucherInventoryEntry.godown,
+            func.count(VoucherInventoryEntry.id).label("entries"),
+            func.sum(func.abs(VoucherInventoryEntry.amount)).label("total_value")
+        )
+        .where(
+            VoucherInventoryEntry.company_name == company_name,
+            VoucherInventoryEntry.godown != None,
+            VoucherInventoryEntry.godown != ""
+        )
+        .group_by(VoucherInventoryEntry.godown)
+        .order_by(desc("total_value"))
+        .limit(10)
+    )
+    godown_result = await db.execute(godown_q)
+    godown_analysis = [
+        {"godown": row[0] or "Main Location", "entries": row[1], "total_value": float(row[2]) if row[2] else 0}
+        for row in godown_result
+    ]
+
+    # Total inventory stats
+    inv_stats_q = (
+        select(
+            func.count(func.distinct(VoucherInventoryEntry.stock_item_name)),
+            func.sum(func.abs(VoucherInventoryEntry.amount)),
+        )
+        .where(VoucherInventoryEntry.company_name == company_name)
+    )
+    inv_stats = (await db.execute(inv_stats_q)).first()
+
+    # ─── 5. CASH FLOW ANALYSIS ────────────────────────────
+    async def ledger_group_total(groups):
+        q = select(func.coalesce(func.sum(Ledger.closing_balance), 0)).where(
+            Ledger.company_name == company_name, Ledger.parent.in_(groups))
+        return abs(float((await db.execute(q)).scalar() or 0))
+
+    cash_bank_groups = ['Cash-in-Hand', 'Cash-in-hand', 'Bank Accounts', 'Bank OD A/c', 'Bank OCC A/c']
+    cash_bank_balance = await ledger_group_total(cash_bank_groups)
+
+    # Opening cash
+    cash_opening_q = select(func.coalesce(func.sum(Ledger.opening_balance), 0)).where(
+        Ledger.company_name == company_name, Ledger.parent.in_(cash_bank_groups))
+    cash_opening = abs(float((await db.execute(cash_opening_q)).scalar() or 0))
+
+    # Operating: revenue - expenses (simplified)
+    cf_operating = total_revenue - total_cogs - total_indirect
+
+    # Investing: Fixed Assets movement
+    invest_groups = ['Fixed Assets', 'Investments']
+    invest_closing = await ledger_group_total(invest_groups)
+    invest_opening_q = select(func.coalesce(func.sum(func.abs(Ledger.opening_balance)), 0)).where(
+        Ledger.company_name == company_name, Ledger.parent.in_(invest_groups))
+    invest_opening = abs(float((await db.execute(invest_opening_q)).scalar() or 0))
+    cf_investing = -(invest_closing - invest_opening)  # increase in assets = cash outflow
+
+    # Financing: Loans & Capital
+    finance_groups = ['Loans (Liability)', 'Secured Loans', 'Unsecured Loans', 'Capital Account',
+                      'Reserves & Surplus', 'Share Capital']
+    finance_closing = await ledger_group_total(finance_groups)
+    finance_opening_q = select(func.coalesce(func.sum(func.abs(Ledger.opening_balance)), 0)).where(
+        Ledger.company_name == company_name, Ledger.parent.in_(finance_groups))
+    finance_opening = abs(float((await db.execute(finance_opening_q)).scalar() or 0))
+    cf_financing = finance_closing - finance_opening
+
+    net_cash_change = cf_operating + cf_investing + cf_financing
+
+    # ─── 6. WORKING CAPITAL & RATIOS ──────────────────────
+    ca_groups = ['Sundry Debtors', 'Cash-in-Hand', 'Cash-in-hand', 'Bank Accounts', 'Bank OD A/c',
+                 'Stock-in-Hand', 'Deposits (Asset)', 'Loans & Advances (Asset)',
+                 'Current Assets']
+    cl_groups = ['Sundry Creditors', 'Duties & Taxes', 'Provisions',
+                 'Current Liabilities']
+
+    current_assets = await ledger_group_total(ca_groups)
+    current_liabilities = await ledger_group_total(cl_groups)
+    working_capital = current_assets - current_liabilities
+    current_ratio = round(current_assets / current_liabilities, 2) if current_liabilities else 0
+
+    # Quick ratio (exclude stock)
+    stock_val = await ledger_group_total(['Stock-in-Hand'])
+    quick_assets = current_assets - stock_val
+    quick_ratio = round(quick_assets / current_liabilities, 2) if current_liabilities else 0
+
+    # Debt-Equity
+    total_debt = await ledger_group_total(['Secured Loans', 'Unsecured Loans', 'Loans (Liability)'])
+    total_equity = await ledger_group_total(['Capital Account', 'Reserves & Surplus', 'Share Capital'])
+    debt_equity = round(total_debt / total_equity, 2) if total_equity else 0
+
+    # ─── 7. RECEIVABLES & PAYABLES ────────────────────────
+    # Top debtors
+    debtors_q = (
+        select(Ledger.name, Ledger.closing_balance, Ledger.party_gstin)
+        .where(Ledger.company_name == company_name,
+               Ledger.parent.in_(['Sundry Debtors']),
+               Ledger.closing_balance != 0)
+        .order_by(desc(func.abs(Ledger.closing_balance)))
+        .limit(15)
+    )
+    debtors = [{"name": r[0], "balance": abs(float(r[1])) if r[1] else 0, "gstin": r[2] or ""}
+               for r in await db.execute(debtors_q)]
+    total_receivables = sum(d["balance"] for d in debtors)
+
+    # Top creditors
+    creditors_q = (
+        select(Ledger.name, Ledger.closing_balance, Ledger.party_gstin)
+        .where(Ledger.company_name == company_name,
+               Ledger.parent.in_(['Sundry Creditors']),
+               Ledger.closing_balance != 0)
+        .order_by(desc(func.abs(Ledger.closing_balance)))
+        .limit(15)
+    )
+    creditors = [{"name": r[0], "balance": abs(float(r[1])) if r[1] else 0, "gstin": r[2] or ""}
+                 for r in await db.execute(creditors_q)]
+    total_payables = sum(c["balance"] for c in creditors)
+
+    # Avg invoice value
+    avg_invoice = round(total_sales_amount / total_sales_count, 2) if total_sales_count else 0
+
+    return {
+        "company_name": company_name,
+        "profitability": {
+            "total_revenue": total_revenue,
+            "total_cogs": total_cogs,
+            "gross_profit": gross_profit,
+            "indirect_expenses": total_indirect,
+            "net_profit": net_profit,
+            "gross_margin": round(gross_margin, 2),
+            "net_margin": round(net_margin, 2),
+            "operating_profit": cf_operating,
+            "operating_margin": round(cf_operating / total_revenue * 100, 2) if total_revenue else 0,
+        },
+        "sales": {
+            "total_invoices": total_sales_count,
+            "total_amount": total_sales_amount,
+            "avg_invoice_value": avg_invoice,
+            "monthly_trend": monthly_sales,
+            "top_customers": top_customers,
+        },
+        "costs": {
+            "total_expenses": total_cogs + total_indirect,
+            "direct_costs": total_cogs,
+            "indirect_costs": total_indirect,
+            "cost_ratio": round((total_cogs + total_indirect) / total_revenue * 100, 2) if total_revenue else 0,
+            "categories": expense_categories,
+            "top_expenses": top_expenses,
+            "monthly_purchases": monthly_purchases,
+        },
+        "inventory": {
+            "unique_items": inv_stats[0] or 0,
+            "total_value": float(inv_stats[1]) if inv_stats[1] else 0,
+            "top_items_by_sales": top_items_by_sales,
+            "godown_analysis": godown_analysis,
+        },
+        "cash_flow": {
+            "opening_cash": cash_opening,
+            "closing_cash": cash_bank_balance,
+            "operating": round(cf_operating, 2),
+            "investing": round(cf_investing, 2),
+            "financing": round(cf_financing, 2),
+            "net_change": round(net_cash_change, 2),
+        },
+        "working_capital": {
+            "current_assets": current_assets,
+            "current_liabilities": current_liabilities,
+            "working_capital": working_capital,
+            "current_ratio": current_ratio,
+            "quick_ratio": quick_ratio,
+            "debt_equity_ratio": debt_equity,
+            "total_debt": total_debt,
+            "total_equity": total_equity,
+            "stock_value": stock_val,
+            "total_receivables": total_receivables,
+            "total_payables": total_payables,
+        },
+        "receivables_payables": {
+            "total_receivables": total_receivables,
+            "total_payables": total_payables,
+            "net_position": total_receivables - total_payables,
+            "debtors": debtors,
+            "creditors": creditors,
+        },
     }
 
 
