@@ -6,7 +6,8 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.api.api import api_router
 from app.core.config import settings
-from app.db.session import warmup_db
+from app.db.session import warmup_db, AsyncSessionLocal
+from sqlalchemy import text
 import asyncio
 
 logger = logging.getLogger(__name__)

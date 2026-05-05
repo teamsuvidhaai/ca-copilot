@@ -10,7 +10,7 @@ from sqlalchemy.future import select
 from sqlalchemy import func, desc, asc, or_, text
 
 from app.api import deps
-from app.models.models import Ledger, Voucher, VoucherEntry, VoucherInventoryEntry, User
+from app.models.models import Ledger, Voucher, VoucherEntry, VoucherInventoryEntry, StockItem, User
 
 router = APIRouter()
 
@@ -808,6 +808,100 @@ async def mis_reports(
             "debtors": debtors,
             "creditors": creditors,
         },
+    }
+
+
+@router.get("/stock-items")
+async def list_stock_items(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+    company_name: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+) -> Any:
+    """
+    List stock items from the stock_items master table synced from Tally,
+    enriched with transaction aggregates from voucher_inventory_entries.
+    """
+    q = select(StockItem)
+    if company_name:
+        q = q.where(StockItem.company_name == company_name)
+    if search:
+        q = q.where(or_(
+            StockItem.name.ilike(f"%{search}%"),
+            StockItem.hsn_code.ilike(f"%{search}%"),
+        ))
+
+    count_q = select(func.count()).select_from(q.subquery())
+    total = (await db.execute(count_q)).scalar() or 0
+
+    q = q.order_by(StockItem.name).offset((page - 1) * per_page).limit(per_page)
+    result = await db.execute(q)
+    items = result.scalars().all()
+
+    # Batch-load transaction aggregates from voucher_inventory_entries
+    item_names = [item.name for item in items]
+    txn_aggs = {}
+    if item_names:
+        agg_q = (
+            select(
+                VoucherInventoryEntry.stock_item_name,
+                func.sum(func.abs(VoucherInventoryEntry.quantity)).label("total_qty"),
+                func.sum(func.abs(VoucherInventoryEntry.amount)).label("total_value"),
+                func.count(VoucherInventoryEntry.id).label("txn_count"),
+                func.max(VoucherInventoryEntry.voucher_date).label("last_txn_date"),
+                func.max(VoucherInventoryEntry.godown).label("godown"),
+                # Fallback fields from inventory entries when master is empty
+                func.max(VoucherInventoryEntry.hsn_code).label("inv_hsn"),
+                func.max(VoucherInventoryEntry.uom).label("inv_uom"),
+                func.max(VoucherInventoryEntry.gst_rate).label("inv_gst_rate"),
+            )
+            .where(VoucherInventoryEntry.stock_item_name.in_(item_names))
+        )
+        if company_name:
+            agg_q = agg_q.where(VoucherInventoryEntry.company_name == company_name)
+        agg_q = agg_q.group_by(VoucherInventoryEntry.stock_item_name)
+        agg_result = await db.execute(agg_q)
+        for row in agg_result:
+            txn_aggs[row[0]] = {
+                "total_qty": float(row[1]) if row[1] else 0,
+                "total_value": float(row[2]) if row[2] else 0,
+                "txn_count": row[3] or 0,
+                "last_txn_date": row[4] or "",
+                "godown": row[5] or "",
+                "inv_hsn": row[6] or "",
+                "inv_uom": row[7] or "",
+                "inv_gst_rate": float(row[8]) if row[8] else 0,
+            }
+
+    return {
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": -(-total // per_page),
+        "data": [
+            {
+                "name": item.name,
+                "parent": item.parent or "",
+                "category": item.category or "",
+                "uom": item.uom or txn_aggs.get(item.name, {}).get("inv_uom", ""),
+                "hsn_code": item.hsn_code or txn_aggs.get(item.name, {}).get("inv_hsn", ""),
+                "gst_rate": float(item.gst_rate) if item.gst_rate else txn_aggs.get(item.name, {}).get("inv_gst_rate", 0),
+                "opening_qty": float(item.opening_balance_qty) if item.opening_balance_qty else 0,
+                "opening_rate": float(item.opening_balance_rate) if item.opening_balance_rate else 0,
+                "opening_value": float(item.opening_balance_value) if item.opening_balance_value else 0,
+                "description": item.description or "",
+                "synced_at": item.synced_at.isoformat() if item.synced_at else None,
+                # Transaction aggregates from voucher_inventory_entries
+                "total_qty": txn_aggs.get(item.name, {}).get("total_qty", 0),
+                "total_value": txn_aggs.get(item.name, {}).get("total_value", 0),
+                "txn_count": txn_aggs.get(item.name, {}).get("txn_count", 0),
+                "last_txn_date": txn_aggs.get(item.name, {}).get("last_txn_date", ""),
+                "godown": txn_aggs.get(item.name, {}).get("godown", ""),
+            }
+            for item in items
+        ],
     }
 
 

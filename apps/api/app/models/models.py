@@ -436,6 +436,32 @@ class VoucherInventoryEntry(Base):
     )
 
 
+class StockItem(Base):
+    """Tally master stock item data, synced via /tally/sync-ledgers (master sync).
+    One row per stock item per company. Contains item details like UOM, HSN, group."""
+    __tablename__ = "stock_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_name = Column(Text, nullable=False, index=True)
+    name = Column(Text, nullable=False)
+    parent = Column(Text, nullable=True)                     # stock group
+    category = Column(Text, nullable=True)                   # stock category
+    uom = Column(Text, nullable=True)                        # base unit of measure
+    opening_balance_qty = Column(sa.Numeric, nullable=True)
+    opening_balance_rate = Column(sa.Numeric, nullable=True)
+    opening_balance_value = Column(sa.Numeric, nullable=True)
+    hsn_code = Column(Text, nullable=True)
+    gst_rate = Column(sa.Numeric, nullable=True)
+    description = Column(Text, nullable=True)
+    synced_at = Column(DateTime(timezone=True), server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint('company_name', 'name', name='uq_stock_items_company_name'),
+        Index('idx_stock_items_parent', 'company_name', 'parent'),
+        Index('idx_stock_items_hsn', 'company_name', 'hsn_code'),
+    )
+
+
 # ══════════════════════════════════════════════════════════════
 # CLIENT DRIVE TABLES
 # ══════════════════════════════════════════════════════════════
