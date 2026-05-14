@@ -30,12 +30,15 @@ logger = logging.getLogger(__name__)
 @router.get("/classify")
 async def classify_fi(
     company_name: str = Query(..., description="Tally company name"),
+    date_from: str = Query(None, description="YYYYMMDD — filter vouchers from this date"),
+    date_to: str = Query(None, description="YYYYMMDD — filter vouchers up to this date"),
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_active_user),
 ) -> Any:
     """Full Financial Instrument classification for a synced Tally company.
-    Returns ledgers, vouchers, holdings, transactions, and summary stats."""
-    result = await classify_company_fi(db, company_name)
+    Returns ledgers, vouchers, holdings, transactions, and summary stats.
+    Optionally filter vouchers by date range (ledger balances always returned)."""
+    result = await classify_company_fi(db, company_name, date_from=date_from, date_to=date_to)
     if not result.get("has_data"):
         raise HTTPException(404, result.get("error", "No data found"))
     return result

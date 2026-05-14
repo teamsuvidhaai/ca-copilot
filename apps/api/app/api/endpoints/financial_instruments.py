@@ -649,15 +649,37 @@ async def get_journal_entries(
 async def list_uploads(
     client_id: str = None,
     instrument_type: str = None,
+    date_from: str = None,
+    date_to: str = None,
     current_user: User = Depends(deps.get_current_user),
     db: AsyncSession = Depends(deps.get_db),
 ) -> Any:
-    """List all financial instrument uploads."""
+    """List all financial instrument uploads.
+    
+    Optional date_from/date_to in YYYYMMDD format filter by created_at.
+    This lets the frontend scope uploads to a selected financial year.
+    """
     query = select(FinancialInstrumentUpload)
     if client_id:
         query = query.where(FinancialInstrumentUpload.client_id == client_id)
     if instrument_type:
         query = query.where(FinancialInstrumentUpload.instrument_type == instrument_type)
+
+    # Date range filtering (YYYYMMDD → datetime)
+    if date_from:
+        try:
+            dt_from = datetime.strptime(date_from, "%Y%m%d")
+            query = query.where(FinancialInstrumentUpload.created_at >= dt_from)
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            from datetime import timedelta
+            dt_to = datetime.strptime(date_to, "%Y%m%d") + timedelta(days=1)
+            query = query.where(FinancialInstrumentUpload.created_at < dt_to)
+        except ValueError:
+            pass
+
     query = query.order_by(FinancialInstrumentUpload.created_at.desc())
 
     result = await db.execute(query)

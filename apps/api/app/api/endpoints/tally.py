@@ -150,6 +150,8 @@ async def list_vouchers(
     company_name: Optional[str] = None,
     voucher_type: Optional[str] = None,
     search: Optional[str] = None,
+    date_from: Optional[str] = Query(None, description="YYYYMMDD — FY start"),
+    date_to: Optional[str] = Query(None, description="YYYYMMDD — FY end"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
 ) -> Any:
@@ -159,6 +161,10 @@ async def list_vouchers(
         q = q.where(Voucher.company_name == company_name)
     if voucher_type:
         q = q.where(Voucher.voucher_type == voucher_type)
+    if date_from:
+        q = q.where(Voucher.date >= date_from)
+    if date_to:
+        q = q.where(Voucher.date <= date_to)
     if search:
         q = q.where(or_(
             Voucher.party_name.ilike(f"%{search}%"),
@@ -212,11 +218,17 @@ async def voucher_stats(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_active_user),
     company_name: Optional[str] = None,
+    date_from: Optional[str] = Query(None, description="YYYYMMDD"),
+    date_to: Optional[str] = Query(None, description="YYYYMMDD"),
 ) -> Any:
-    """Dashboard stats for Tally vouchers by type, optionally filtered by company."""
+    """Dashboard stats for Tally vouchers by type, optionally filtered by company and date range."""
     base = select(func.count(Voucher.id))
     if company_name:
         base = base.where(Voucher.company_name == company_name)
+    if date_from:
+        base = base.where(Voucher.date >= date_from)
+    if date_to:
+        base = base.where(Voucher.date <= date_to)
     total = (await db.execute(base)).scalar() or 0
 
     type_counts = {}
@@ -224,6 +236,10 @@ async def voucher_stats(
         q = select(func.count(Voucher.id)).where(Voucher.voucher_type == vtype)
         if company_name:
             q = q.where(Voucher.company_name == company_name)
+        if date_from:
+            q = q.where(Voucher.date >= date_from)
+        if date_to:
+            q = q.where(Voucher.date <= date_to)
         c = (await db.execute(q)).scalar() or 0
         type_counts[vtype.lower()] = c
 
@@ -450,10 +466,13 @@ async def mis_reports(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_active_user),
     company_name: Optional[str] = None,
+    date_from: Optional[str] = Query(None, description="YYYYMMDD — filters vouchers/transactions"),
+    date_to: Optional[str] = Query(None, description="YYYYMMDD — filters vouchers/transactions"),
 ) -> Any:
     """
     MIS Reports — Profitability, Sales, Cost & Inventory analysis
     computed from synced Tally ledgers, vouchers, and inventory entries.
+    Optionally scoped to a date range (for FY filtering).
     """
     if not company_name:
         raise HTTPException(400, "company_name is required")
@@ -501,9 +520,12 @@ async def mis_reports(
             func.sum(func.abs(Voucher.amount)).label("total")
         )
         .where(Voucher.company_name == company_name, Voucher.voucher_type == "Sales")
-        .group_by(month_col)
-        .order_by(month_col)
     )
+    if date_from:
+        monthly_sales_q = monthly_sales_q.where(Voucher.date >= date_from)
+    if date_to:
+        monthly_sales_q = monthly_sales_q.where(Voucher.date <= date_to)
+    monthly_sales_q = monthly_sales_q.group_by(month_col).order_by(month_col)
     monthly_result = await db.execute(monthly_sales_q)
     monthly_sales = [
         {"month": row[0], "count": row[1], "total": float(row[2]) if row[2] else 0}
@@ -519,10 +541,12 @@ async def mis_reports(
         )
         .where(Voucher.company_name == company_name, Voucher.voucher_type == "Sales",
                Voucher.party_name != None, Voucher.party_name != "")
-        .group_by(Voucher.party_name)
-        .order_by(desc("total"))
-        .limit(10)
     )
+    if date_from:
+        top_customers_q = top_customers_q.where(Voucher.date >= date_from)
+    if date_to:
+        top_customers_q = top_customers_q.where(Voucher.date <= date_to)
+    top_customers_q = top_customers_q.group_by(Voucher.party_name).order_by(desc("total")).limit(10)
     top_cust_result = await db.execute(top_customers_q)
     top_customers = [
         {"name": row[0], "invoice_count": row[1], "total": float(row[2]) if row[2] else 0}
@@ -537,6 +561,10 @@ async def mis_reports(
         )
         .where(Voucher.company_name == company_name, Voucher.voucher_type == "Sales")
     )
+    if date_from:
+        sales_total_q = sales_total_q.where(Voucher.date >= date_from)
+    if date_to:
+        sales_total_q = sales_total_q.where(Voucher.date <= date_to)
     st_res = (await db.execute(sales_total_q)).first()
     total_sales_count = st_res[0] or 0
     total_sales_amount = float(st_res[1]) if st_res[1] else 0
@@ -590,9 +618,12 @@ async def mis_reports(
             func.sum(func.abs(Voucher.amount)).label("total")
         )
         .where(Voucher.company_name == company_name, Voucher.voucher_type == "Purchase")
-        .group_by(pmonth_col)
-        .order_by(pmonth_col)
     )
+    if date_from:
+        monthly_purchase_q = monthly_purchase_q.where(Voucher.date >= date_from)
+    if date_to:
+        monthly_purchase_q = monthly_purchase_q.where(Voucher.date <= date_to)
+    monthly_purchase_q = monthly_purchase_q.group_by(pmonth_col).order_by(pmonth_col)
     monthly_purch_result = await db.execute(monthly_purchase_q)
     monthly_purchases = [
         {"month": row[0], "count": row[1], "total": float(row[2]) if row[2] else 0}
@@ -612,6 +643,13 @@ async def mis_reports(
             VoucherInventoryEntry.company_name == company_name,
             VoucherInventoryEntry.voucher_type == "Sales"
         )
+    )
+    if date_from:
+        top_items_sales_q = top_items_sales_q.where(VoucherInventoryEntry.voucher_date >= date_from)
+    if date_to:
+        top_items_sales_q = top_items_sales_q.where(VoucherInventoryEntry.voucher_date <= date_to)
+    top_items_sales_q = (
+        top_items_sales_q
         .group_by(VoucherInventoryEntry.stock_item_name)
         .order_by(desc("total_value"))
         .limit(10)
@@ -817,6 +855,8 @@ async def list_stock_items(
     current_user: User = Depends(deps.get_current_active_user),
     company_name: Optional[str] = None,
     search: Optional[str] = None,
+    date_from: Optional[str] = Query(None, description="YYYYMMDD — filter txn aggregates"),
+    date_to: Optional[str] = Query(None, description="YYYYMMDD — filter txn aggregates"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
 ) -> Any:
@@ -861,6 +901,10 @@ async def list_stock_items(
         )
         if company_name:
             agg_q = agg_q.where(VoucherInventoryEntry.company_name == company_name)
+        if date_from:
+            agg_q = agg_q.where(VoucherInventoryEntry.voucher_date >= date_from)
+        if date_to:
+            agg_q = agg_q.where(VoucherInventoryEntry.voucher_date <= date_to)
         agg_q = agg_q.group_by(VoucherInventoryEntry.stock_item_name)
         agg_result = await db.execute(agg_q)
         for row in agg_result:

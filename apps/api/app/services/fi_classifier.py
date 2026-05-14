@@ -242,10 +242,17 @@ def parse_share_details(narration: str) -> dict:
 #  MAIN CLASSIFICATION ENTRY POINT
 # ═══════════════════════════════════════════════════════
 
-async def classify_company_fi(db, company_name: str) -> dict:
+async def classify_company_fi(db, company_name: str, date_from: str = None, date_to: str = None) -> dict:
     """
     Classify all ledgers and vouchers for a Tally-synced company
     into Financial Instrument categories.
+
+    Args:
+        date_from: YYYYMMDD — filter vouchers from this date (inclusive)
+        date_to:   YYYYMMDD — filter vouchers up to this date (inclusive)
+        When date range is provided, ledger balances are recomputed as
+        opening_balance + net voucher entry movements within the period,
+        so AUM/holdings reflect the selected FY correctly.
 
     Returns a rich dashboard-ready dict with:
       - fi_ledgers: classified ledger list with balances
@@ -259,11 +266,33 @@ async def classify_company_fi(db, company_name: str) -> dict:
     from app.models.models import Ledger, Voucher, VoucherEntry
 
     # ── 1. Classify Ledgers ──────────────────────────────
-    ledgers = (await db.execute(
+    # Derive fy_period from date_from (e.g. "20250401" → "2025-26")
+    fy_period = None
+    if date_from and len(date_from) >= 4:
+        try:
+            y = int(date_from[:4])
+            fy_period = f"{y}-{(y + 1) % 100:02d}"
+        except ValueError:
+            pass
+
+    ledger_query = (
         select(Ledger)
         .where(Ledger.company_name == company_name)
-        .order_by(Ledger.parent, Ledger.name)
-    )).scalars().all()
+    )
+    if fy_period:
+        ledger_query = ledger_query.where(Ledger.fy_period == fy_period)
+    ledger_query = ledger_query.order_by(Ledger.parent, Ledger.name)
+
+    ledgers = (await db.execute(ledger_query)).scalars().all()
+
+    # Fallback: if no FY-specific rows found, try without fy_period filter
+    if not ledgers and fy_period:
+        logger.info(f"No ledgers found for fy_period={fy_period}, falling back to all ledgers")
+        ledgers = (await db.execute(
+            select(Ledger)
+            .where(Ledger.company_name == company_name)
+            .order_by(Ledger.parent, Ledger.name)
+        )).scalars().all()
 
     if not ledgers:
         return {"error": f"No ledgers found for '{company_name}'", "has_data": False}
@@ -292,11 +321,18 @@ async def classify_company_fi(db, company_name: str) -> dict:
             non_fi_count += 1
 
     # ── 2. Classify Vouchers ─────────────────────────────
-    vouchers = (await db.execute(
+    voucher_query = (
         select(Voucher)
         .where(Voucher.company_name == company_name)
-        .order_by(desc(Voucher.date))
-    )).scalars().all()
+    )
+    # Apply date range filtering when FY is selected
+    if date_from:
+        voucher_query = voucher_query.where(Voucher.date >= date_from)
+    if date_to:
+        voucher_query = voucher_query.where(Voucher.date <= date_to)
+    voucher_query = voucher_query.order_by(desc(Voucher.date))
+
+    vouchers = (await db.execute(voucher_query)).scalars().all()
 
     fi_vouchers = []
     non_fi_voucher_count = 0
@@ -343,12 +379,16 @@ async def classify_company_fi(db, company_name: str) -> dict:
                 extra_guids.add(e.voucher_guid)
 
         if extra_guids:
-            extra_vouchers = (await db.execute(
-                select(Voucher).where(
-                    Voucher.company_name == company_name,
-                    Voucher.guid.in_(extra_guids),
-                )
-            )).scalars().all()
+            extra_q = select(Voucher).where(
+                Voucher.company_name == company_name,
+                Voucher.guid.in_(extra_guids),
+            )
+            # Apply the same date range filter as the main voucher query
+            if date_from:
+                extra_q = extra_q.where(Voucher.date >= date_from)
+            if date_to:
+                extra_q = extra_q.where(Voucher.date <= date_to)
+            extra_vouchers = (await db.execute(extra_q)).scalars().all()
             for v in extra_vouchers:
                 amt = float(v.amount or 0)
                 fi_vouchers.append({
@@ -369,6 +409,73 @@ async def classify_company_fi(db, company_name: str) -> dict:
 
         # Sort combined list by date descending
         fi_vouchers.sort(key=lambda x: x["date"] or "", reverse=True)
+
+    # ── 3.5. Compute FY-specific balances when date range is provided ──
+    # Reconstruct the ledger balance at any point in time using:
+    #   Balance@date = Tally opening_balance + SUM(voucher_entries WHERE date <= that_date)
+    #
+    # FY Opening = Tally OB + cumulative movements BEFORE date_from
+    # FY Closing = Tally OB + cumulative movements UP TO date_to
+    # FY Movement = FY Closing - FY Opening (net change during this FY)
+    if (date_from or date_to) and fi_ledger_names:
+        # Query 1: Cumulative movements UP TO date_to → FY closing balance
+        closing_query = (
+            select(
+                VoucherEntry.ledger_name,
+                func.sum(VoucherEntry.amount).label("cumulative"),
+            )
+            .where(
+                VoucherEntry.company_name == company_name,
+                VoucherEntry.ledger_name.in_(fi_ledger_names),
+            )
+            .group_by(VoucherEntry.ledger_name)
+        )
+        if date_to:
+            closing_query = closing_query.where(VoucherEntry.voucher_date <= date_to)
+
+        closing_rows = (await db.execute(closing_query)).all()
+        closing_map = {row.ledger_name: float(row.cumulative or 0) for row in closing_rows}
+
+        # Query 2: Cumulative movements BEFORE date_from → FY opening balance
+        opening_map = {}
+        if date_from:
+            opening_query = (
+                select(
+                    VoucherEntry.ledger_name,
+                    func.sum(VoucherEntry.amount).label("cumulative"),
+                )
+                .where(
+                    VoucherEntry.company_name == company_name,
+                    VoucherEntry.ledger_name.in_(fi_ledger_names),
+                    VoucherEntry.voucher_date < date_from,
+                )
+                .group_by(VoucherEntry.ledger_name)
+            )
+            opening_rows = (await db.execute(opening_query)).all()
+            opening_map = {row.ledger_name: float(row.cumulative or 0) for row in opening_rows}
+
+        # Update fi_ledgers with FY-specific balances
+        for fl in fi_ledgers:
+            tally_ob = fl["opening_balance"]  # Tally's opening balance (start of loaded period)
+
+            # FY closing = Tally OB + all movements up to end of selected FY
+            cum_to_end = closing_map.get(fl["name"], 0)
+            fy_closing = tally_ob + cum_to_end
+
+            # FY opening = Tally OB + all movements before selected FY started
+            cum_before_start = opening_map.get(fl["name"], 0)
+            fy_opening = tally_ob + cum_before_start
+
+            fl["tally_closing_balance"] = fl["closing_balance"]  # preserve original
+            fl["opening_balance"] = round(fy_opening, 2)
+            fl["closing_balance"] = round(fy_closing, 2)
+            fl["fy_movement"] = round(fy_closing - fy_opening, 2)
+            fl["net_movement"] = round(fy_closing - fy_opening, 2)
+
+        logger.info(
+            f"FI FY-specific balances: {len(closing_map)} ledgers computed "
+            f"({date_from} to {date_to})"
+        )
 
     # ── 4. Build Holdings Summary ────────────────────────
     holdings = defaultdict(lambda: {"ledgers": [], "total_ob": 0, "total_cb": 0, "count": 0})

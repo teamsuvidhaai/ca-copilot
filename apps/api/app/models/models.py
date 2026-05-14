@@ -305,12 +305,13 @@ class VoucherTaxItem(Base):
 
 class Ledger(Base):
     """Tally master ledger data, synced via /tally/sync-ledgers.
-    One row per ledger per company. Upserted on every sync."""
+    One row per ledger per company per fiscal year. Upserted on every sync."""
     __tablename__ = "ledgers"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     company_name = Column(Text, nullable=False, index=True)
     name = Column(Text, nullable=False)
+    fy_period = Column(Text, nullable=True)                  # e.g. '2025-26' — fiscal year this balance belongs to
     parent = Column(Text, nullable=True)                     # immediate parent group (e.g. 'WHITE OAK PIONEER EQUITY')
     primary_group = Column(Text, nullable=True)              # root BS group resolved from hierarchy (e.g. 'Investments')
     opening_balance = Column(sa.Numeric, nullable=True)      # positive = Cr, negative = Dr
@@ -326,9 +327,10 @@ class Ledger(Base):
     synced_at = Column(DateTime(timezone=True), server_default=sa.func.now())
 
     __table_args__ = (
-        sa.UniqueConstraint('company_name', 'name', name='uq_ledgers_company_name'),
+        sa.UniqueConstraint('company_name', 'name', 'fy_period', name='uq_ledgers_company_name_fy'),
         Index('idx_ledgers_parent', 'company_name', 'parent'),
         Index('idx_ledgers_primary_group', 'company_name', 'primary_group'),
+        Index('idx_ledgers_fy', 'company_name', 'fy_period'),
     )
 
 
