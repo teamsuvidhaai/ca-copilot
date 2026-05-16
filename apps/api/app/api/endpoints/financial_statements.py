@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from app.services.fs_rule_parser import parse_trial_balance, parse_balance_sheet, map_tb_to_schedule_iii
+from app.services.schedule_iii_mapping import TALLY_TO_SCHEDULE_III, match_tally_group as _match_group
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select, func
@@ -250,9 +251,9 @@ async def _extract_text(file_bytes: bytes, filename: str) -> str:
     return "\n\n--- PAGE BREAK ---\n\n".join(pages)
 
 
-async def _call_claude(prompt: str, text: str, max_tokens: int = 16000) -> dict:
-    """Rule-based parser replacement for AI call.
-    Routes to appropriate parser based on prompt content."""
+async def _parse_document(prompt: str, text: str, max_tokens: int = 16000) -> dict:
+    """Rule-based parser — routes to appropriate parser based on prompt content.
+    Deterministic, no AI/LLM calls."""
     prompt_lower = prompt.lower()[:200]
     if 'trial balance' in prompt_lower:
         return parse_trial_balance(text)
@@ -289,53 +290,18 @@ def _upload_to_supabase(file_bytes: bytes, job_id: str, filename: str) -> str:
 # ─── Tally TB → structured data ───────────────────────
 def _tally_ledgers_to_tb(ledgers: list) -> dict:
     """Convert raw Tally ledger rows into the same structured TB format
-    that the AI extraction produces, so the downstream generation
-    prompt receives identical input regardless of source."""
+    that the rule-based parser produces, so the downstream generation
+    receives identical input regardless of source.
+    Uses the canonical TALLY_TO_SCHEDULE_III mapping from the tally module."""
     # Tally convention: positive closing_balance = Credit, negative = Debit
-    TALLY_GROUP_MAP = {
-        # Equity
-        'capital account': ('Equity', 'Share Capital'),
-        'reserves & surplus': ('Equity', 'Reserves & Surplus'),
-        'share capital': ('Equity', 'Share Capital'),
-        # Non-current liabilities
-        'secured loans': ('Liability', 'Long Term Borrowings'),
-        'unsecured loans': ('Liability', 'Long Term Borrowings'),
-        'loans (liability)': ('Liability', 'Long Term Borrowings'),
-        # Current liabilities
-        'sundry creditors': ('Liability', 'Trade Payables'),
-        'duties & taxes': ('Liability', 'Other Current Liabilities'),
-        'provisions': ('Liability', 'Short Term Provisions'),
-        'current liabilities': ('Liability', 'Other Current Liabilities'),
-        # Fixed assets
-        'fixed assets': ('Asset', 'Fixed Assets (Tangible)'),
-        # Investments
-        'investments': ('Asset', 'Non-Current Investments'),
-        # Current assets
-        'sundry debtors': ('Asset', 'Trade Receivables'),
-        'bank accounts': ('Asset', 'Cash & Bank Balances'),
-        'cash-in-hand': ('Asset', 'Cash & Bank Balances'),
-        'bank od a/c': ('Liability', 'Short Term Borrowings'),
-        'deposits (asset)': ('Asset', 'Short Term Loans & Advances'),
-        'loans & advances (asset)': ('Asset', 'Short Term Loans & Advances'),
-        'stock-in-hand': ('Asset', 'Inventories'),
-        # Income
-        'sales accounts': ('Income', 'Revenue from Operations'),
-        'direct income': ('Income', 'Revenue from Operations'),
-        'indirect income': ('Income', 'Other Income'),
-        # Expenses
-        'purchase accounts': ('Expense', 'Cost of Materials'),
-        'direct expenses': ('Expense', 'Cost of Materials'),
-        'indirect expenses': ('Expense', 'Other Expenses'),
-        'manufacturing expenses': ('Expense', 'Cost of Materials'),
-    }
     accounts = []
     total_dr = 0
     total_cr = 0
     for l in ledgers:
         cb = float(l.get('closing_balance', 0) or 0)
         ob = float(l.get('opening_balance', 0) or 0)
-        parent = (l.get('parent') or '').lower().strip()
-        category, schedule_group = TALLY_GROUP_MAP.get(parent, ('Asset', 'Other Current Assets'))
+        parent = (l.get('parent') or '').strip()
+        category, schedule_group, note_ref = _match_group(parent)
         dr = abs(cb) if cb < 0 else None
         cr = cb if cb > 0 else None
         total_dr += dr or 0
@@ -393,7 +359,7 @@ async def _process_job(job_id: str, files_data: dict):
             # 2. Structure Trial Balance
             row.status = "parsing_tb"
             await db.commit()
-            tb_structured = await _call_claude(TB_EXTRACTION_PROMPT, extracted.get("trial_balance", ""))
+            tb_structured = await _parse_document(TB_EXTRACTION_PROMPT, extracted.get("trial_balance", ""))
             row.trial_balance_data = tb_structured
             if tb_structured.get("company_name"):
                 row.company_name = tb_structured["company_name"]
@@ -404,7 +370,7 @@ async def _process_job(job_id: str, files_data: dict):
             if "prev_balance_sheet" in extracted and extracted["prev_balance_sheet"].strip():
                 row.status = "parsing_bs"
                 await db.commit()
-                prev_bs = await _call_claude(BS_EXTRACTION_PROMPT, extracted["prev_balance_sheet"])
+                prev_bs = await _parse_document(BS_EXTRACTION_PROMPT, extracted["prev_balance_sheet"])
                 row.prev_bs_data = prev_bs
                 await db.commit()
 
@@ -480,7 +446,7 @@ async def _process_tally_job(job_id: str, tally_tb: dict, files_data: dict):
                     if role == 'prev_balance_sheet':
                         row.status = "parsing_bs"
                         await db.commit()
-                        prev_bs = await _call_claude(BS_EXTRACTION_PROMPT, text)
+                        prev_bs = await _parse_document(BS_EXTRACTION_PROMPT, text)
                         row.prev_bs_data = prev_bs
                     elif role == 'notes':
                         extracted_notes = text
@@ -500,7 +466,7 @@ async def _process_tally_job(job_id: str, tally_tb: dict, files_data: dict):
                 combined_input += "=== NOTES TO ACCOUNTS ===\n"
                 combined_input += extracted_notes + "\n"
 
-            result = await _call_claude(MAPPING_AND_GENERATION_PROMPT, combined_input, max_tokens=16000)
+            result = await _parse_document(MAPPING_AND_GENERATION_PROMPT, combined_input, max_tokens=16000)
 
             is_balanced = None
             if result.get("balance_sheet"):

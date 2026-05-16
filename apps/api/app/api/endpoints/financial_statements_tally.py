@@ -13,7 +13,10 @@ Endpoints:
 """
 
 from typing import Any
+import hashlib
+import json
 import logging
+import uuid
 from collections import defaultdict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -23,121 +26,24 @@ from sqlalchemy.future import select
 from sqlalchemy import func
 
 from app.api import deps
-from app.models.models import User, Ledger, Voucher
+from app.models.models import FinancialStatementJob, User, Ledger, Voucher
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 # ═══════════════════════════════════════════════════════
-#  TALLY GROUP → SCHEDULE III MAPPING
+#  TALLY GROUP → SCHEDULE III MAPPING (single source of truth)
 # ═══════════════════════════════════════════════════════
 
-# Maps Tally parent groups (lowercase) to (category, schedule_group, note_no)
-TALLY_TO_SCHEDULE_III = {
-    # ── Equity ──
-    'capital account':           ('Equity',    'Share Capital',                 'Note 1'),
-    'share capital':             ('Equity',    'Share Capital',                 'Note 1'),
-    'reserves & surplus':        ('Equity',    'Reserves & Surplus',            'Note 2'),
-    'retained earnings':         ('Equity',    'Reserves & Surplus',            'Note 2'),
-
-    # ── Non-Current Liabilities ──
-    'secured loans':             ('Liability', 'Long-Term Borrowings',          'Note 3'),
-    'unsecured loans':           ('Liability', 'Long-Term Borrowings',          'Note 3'),
-    'loans (liability)':         ('Liability', 'Long-Term Borrowings',          'Note 3'),
-    'deferred tax liability':    ('Liability', 'Deferred Tax Liabilities (Net)','Note 4'),
-    'long term provisions':      ('Liability', 'Long-Term Provisions',          'Note 5'),
-
-    # ── Current Liabilities ──
-    'bank od a/c':               ('Liability', 'Short-Term Borrowings',         'Note 6'),
-    'sundry creditors':          ('Liability', 'Trade Payables',                'Note 7'),
-    'trade payables':            ('Liability', 'Trade Payables',                'Note 7'),
-    'duties & taxes':            ('Liability', 'Other Current Liabilities',     'Note 8'),
-    'current liabilities':       ('Liability', 'Other Current Liabilities',     'Note 8'),
-    'provisions':                ('Liability', 'Short-Term Provisions',         'Note 9'),
-
-    # ── Non-Current Assets ──
-    'fixed assets':              ('Asset',     'Tangible Assets',               'Note 10'),
-    'intangible assets':         ('Asset',     'Intangible Assets',             'Note 11'),
-    'capital work-in-progress':  ('Asset',     'Capital Work-in-Progress',      'Note 12'),
-    'investments':               ('Asset',     'Non-Current Investments',       'Note 13'),
-    'long term loans & advances':('Asset',     'Long-Term Loans & Advances',    'Note 14'),
-
-    # ── Current Assets ──
-    'stock-in-hand':             ('Asset',     'Inventories',                   'Note 15'),
-    'closing stock':             ('Asset',     'Inventories',                   'Note 15'),
-    'sundry debtors':            ('Asset',     'Trade Receivables',             'Note 16'),
-    'trade receivables':         ('Asset',     'Trade Receivables',             'Note 16'),
-    'bank accounts':             ('Asset',     'Cash & Cash Equivalents',       'Note 17'),
-    'cash-in-hand':              ('Asset',     'Cash & Cash Equivalents',       'Note 17'),
-    'deposits (asset)':          ('Asset',     'Short-Term Loans & Advances',   'Note 18'),
-    'loans & advances (asset)':  ('Asset',     'Short-Term Loans & Advances',   'Note 18'),
-    'other current assets':      ('Asset',     'Other Current Assets',          'Note 19'),
-
-    # ── Revenue ──
-    'sales accounts':            ('Income',    'Revenue from Operations',       'Note 20'),
-    'direct income':             ('Income',    'Revenue from Operations',       'Note 20'),
-    'indirect income':           ('Income',    'Other Income',                  'Note 21'),
-
-    # ── Expenses ──
-    'purchase accounts':         ('Expense',   'Cost of Materials Consumed',    'Note 22'),
-    'manufacturing expenses':    ('Expense',   'Cost of Materials Consumed',    'Note 22'),
-    'direct expenses':           ('Expense',   'Changes in Inventories',        'Note 23'),
-    'employee benefit expense':  ('Expense',   'Employee Benefit Expense',      'Note 24'),
-    'salary':                    ('Expense',   'Employee Benefit Expense',      'Note 24'),
-    'indirect expenses':         ('Expense',   'Other Expenses',               'Note 27'),
-    'depreciation':              ('Expense',   'Depreciation & Amortisation',   'Note 25'),
-    'bank charges':              ('Expense',   'Finance Costs',                'Note 26'),
-    'interest paid':             ('Expense',   'Finance Costs',                'Note 26'),
-    'interest expense':          ('Expense',   'Finance Costs',                'Note 26'),
-}
-
-
-def _match_group(parent: str) -> tuple:
-    """Fuzzy-match a Tally parent group to Schedule III mapping."""
-    p = parent.lower().strip()
-    # Exact match
-    if p in TALLY_TO_SCHEDULE_III:
-        return TALLY_TO_SCHEDULE_III[p]
-    # Partial match
-    for key, val in TALLY_TO_SCHEDULE_III.items():
-        if key in p or p in key:
-            return val
-    # Fallback based on common patterns
-    if any(kw in p for kw in ['expense', 'charges', 'rent', 'insurance', 'repairs']):
-        return ('Expense', 'Other Expenses', 'Note 27')
-    if any(kw in p for kw in ['income', 'revenue', 'receipt']):
-        return ('Income', 'Other Income', 'Note 21')
-    if any(kw in p for kw in ['loan', 'advance', 'deposit']):
-        return ('Asset', 'Short-Term Loans & Advances', 'Note 18')
-    if any(kw in p for kw in ['creditor', 'payable']):
-        return ('Liability', 'Trade Payables', 'Note 7')
-    if any(kw in p for kw in ['debtor', 'receivable']):
-        return ('Asset', 'Trade Receivables', 'Note 16')
-    return ('Asset', 'Other Current Assets', 'Note 19')
-
-
-# ═══════════════════════════════════════════════════════
-#  SCHEDULE III GROUP ORDERING
-# ═══════════════════════════════════════════════════════
-
-BS_EQUITY_LIAB_ORDER = [
-    ("Shareholders' Funds", ['Share Capital', 'Reserves & Surplus']),
-    ("Non-Current Liabilities", ['Long-Term Borrowings', 'Deferred Tax Liabilities (Net)', 'Long-Term Provisions']),
-    ("Current Liabilities", ['Short-Term Borrowings', 'Trade Payables', 'Other Current Liabilities', 'Short-Term Provisions']),
-]
-
-BS_ASSETS_ORDER = [
-    ("Non-Current Assets", ['Tangible Assets', 'Intangible Assets', 'Capital Work-in-Progress', 'Non-Current Investments', 'Long-Term Loans & Advances']),
-    ("Current Assets", ['Inventories', 'Trade Receivables', 'Cash & Cash Equivalents', 'Short-Term Loans & Advances', 'Other Current Assets']),
-]
-
-PL_INCOME_ORDER = ['Revenue from Operations', 'Other Income']
-PL_EXPENSE_ORDER = [
-    'Cost of Materials Consumed', 'Changes in Inventories',
-    'Employee Benefit Expense', 'Finance Costs',
-    'Depreciation & Amortisation', 'Other Expenses',
-]
+from app.services.schedule_iii_mapping import (
+    TALLY_TO_SCHEDULE_III,
+    match_tally_group as _match_group,
+    BS_EQUITY_LIAB_ORDER,
+    BS_ASSETS_ORDER,
+    PL_INCOME_ORDER,
+    PL_EXPENSE_ORDER,
+)
 
 
 # ═══════════════════════════════════════════════════════
@@ -265,9 +171,11 @@ async def generate_schedule_iii(
     Generate complete Schedule III financial statements from Tally ledgers.
     Returns: Balance Sheet, Profit & Loss, and Note-wise Schedules.
     All computed deterministically — no AI calls needed.
+    Results are persisted to FinancialStatementJob for history.
     """
     company_name = body.get("company_name")
     financial_year = body.get("financial_year", "2025-26")
+    client_id = body.get("client_id")
 
     if not company_name:
         raise HTTPException(400, "company_name required")
@@ -517,8 +425,8 @@ async def generate_schedule_iii(
         f"vouchers={voucher_count}, balanced={balance_sheet['is_balanced']}"
     )
 
-    return JSONResponse(content={
-        'has_data': True,
+    # ── Persist to FinancialStatementJob for history ──
+    result_payload = {
         'company_name': company_name,
         'financial_year': financial_year,
         'total_ledgers': len(ledgers),
@@ -538,4 +446,33 @@ async def generate_schedule_iii(
             'net_profit': round(pat_cy, 2),
             'is_balanced': balance_sheet['is_balanced'],
         },
+    }
+
+    job_id = None
+    if client_id:
+        job_id = str(uuid.uuid4())
+        ledger_hash = hashlib.sha256(
+            json.dumps({'company': company_name, 'fy': financial_year, 'n': len(ledgers)}).encode()
+        ).hexdigest()
+
+        job = FinancialStatementJob(
+            id=job_id,
+            client_id=client_id,
+            user_id=str(current_user.id),
+            filenames={'source': 'tally', 'company': company_name},
+            file_hash=ledger_hash,
+            status='completed',
+            company_name=company_name,
+            financial_year=financial_year,
+            is_balanced=balance_sheet['is_balanced'],
+            result=result_payload,
+        )
+        db.add(job)
+        await db.commit()
+        logger.info(f"✅ FS-Tally job {job_id} persisted for client {client_id}")
+
+    return JSONResponse(content={
+        'has_data': True,
+        'job_id': job_id,
+        **result_payload,
     })

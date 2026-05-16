@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func, desc, asc, or_, text
+from sqlalchemy import func, desc, asc, or_, and_, text
 
 from app.api import deps
 from app.models.models import Ledger, Voucher, VoucherEntry, VoucherInventoryEntry, StockItem, User
@@ -991,3 +991,719 @@ async def inventory_hsn_summary(
         }
         for row in result
     ]
+
+
+@router.get("/refund-data")
+async def get_refund_data(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+    company_name: str = Query(..., description="Tally company name"),
+    date_from: Optional[str] = Query(None, description="Start date YYYYMMDD"),
+    date_to: Optional[str] = Query(None, description="End date YYYYMMDD"),
+    refund_type: str = Query(..., description="Refund type key"),
+) -> Any:
+    """
+    Aggregate Tally data into GST Refund Calculator fields.
+
+    Extracts turnover, ITC, and tax data from synced Tally ledgers and vouchers
+    for the selected company and date range. Returns pre-filled values in the
+    exact format the /reconciliation/calculate-refund endpoint expects.
+
+    The CA reviews these values and can adjust before submitting for calculation.
+    """
+    from sqlalchemy import case as sa_case
+
+    # ── Helper: sum voucher amounts by type within date range ──
+    async def sum_vouchers(v_type: str, date_from_: str = None, date_to_: str = None):
+        q = (
+            select(func.coalesce(func.sum(func.abs(Voucher.amount)), 0))
+            .where(Voucher.company_name == company_name)
+            .where(Voucher.voucher_type == v_type)
+        )
+        if date_from_:
+            q = q.where(Voucher.date >= date_from_)
+        if date_to_:
+            q = q.where(Voucher.date <= date_to_)
+        return float((await db.execute(q)).scalar() or 0)
+
+    # ── Helper: sum ledger closing balances by parent groups ──
+    async def sum_ledgers(parents: list):
+        q = (
+            select(func.coalesce(func.sum(func.abs(Ledger.closing_balance)), 0))
+            .where(Ledger.company_name == company_name)
+            .where(Ledger.parent.in_(parents))
+        )
+        return float((await db.execute(q)).scalar() or 0)
+
+    # ── Helper: sum voucher entries by ledger parent within date range ──
+    async def sum_voucher_entries_by_parent(parents: list, is_debit: bool = None,
+                                            date_from_: str = None, date_to_: str = None):
+        q = (
+            select(func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0))
+            .where(VoucherEntry.company_name == company_name)
+        )
+        if date_from_:
+            q = q.where(VoucherEntry.voucher_date >= date_from_)
+        if date_to_:
+            q = q.where(VoucherEntry.voucher_date <= date_to_)
+        if is_debit is not None:
+            q = q.where(VoucherEntry.is_debit == is_debit)
+
+        # Join with Ledger to filter by parent group
+        q = q.where(
+            VoucherEntry.ledger_name.in_(
+                select(Ledger.name)
+                .where(Ledger.company_name == company_name)
+                .where(Ledger.parent.in_(parents))
+            )
+        )
+        return float((await db.execute(q)).scalar() or 0)
+
+    # ── Helper: sum sales voucher entries for export-type ledgers ──
+    async def sum_export_sales(date_from_: str = None, date_to_: str = None):
+        """
+        Export sales identified by ledger names containing common export keywords.
+        The CA should verify/adjust this value.
+        """
+        export_keywords = ['export', 'zero rated', 'zero-rated', 'sez', 'lut',
+                           'deemed export', 'foreign', 'overseas']
+        conditions = [Ledger.name.ilike(f"%{kw}%") for kw in export_keywords]
+
+        export_ledger_q = (
+            select(Ledger.name)
+            .where(Ledger.company_name == company_name)
+            .where(Ledger.parent.in_(['Sales Accounts', 'Sales Account']))
+            .where(or_(*conditions))
+        )
+        export_ledgers = [row[0] for row in await db.execute(export_ledger_q)]
+
+        if not export_ledgers:
+            return 0.0, []
+
+        q = (
+            select(func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0))
+            .where(VoucherEntry.company_name == company_name)
+            .where(VoucherEntry.ledger_name.in_(export_ledgers))
+            .where(VoucherEntry.is_debit == False)
+        )
+        if date_from_:
+            q = q.where(VoucherEntry.voucher_date >= date_from_)
+        if date_to_:
+            q = q.where(VoucherEntry.voucher_date <= date_to_)
+
+        total = float((await db.execute(q)).scalar() or 0)
+        return total, export_ledgers
+
+    # ══════════════════════════════════════════════════════════
+    # AGGREGATE DATA BASED ON REFUND TYPE
+    # ══════════════════════════════════════════════════════════
+    notes = []
+    fields = {}
+
+    # ── Total Sales Turnover ──
+    total_sales = await sum_vouchers("Sales", date_from, date_to)
+
+    # ── Total Purchases ──
+    total_purchases = await sum_vouchers("Purchase", date_from, date_to)
+
+    # ── Tax ledger groups (ITC) ──
+    tax_input_parents = ['Duties & Taxes']
+    itc_total = await sum_voucher_entries_by_parent(
+        tax_input_parents, is_debit=True, date_from_=date_from, date_to_=date_to
+    )
+
+    # ── Capital Goods ITC ──
+    capital_parents = ['Fixed Assets']
+    capital_goods_itc = await sum_voucher_entries_by_parent(
+        tax_input_parents, is_debit=True, date_from_=date_from, date_to_=date_to
+    )
+    # Approximate: tax entries on purchase vouchers involving fixed asset ledgers
+    cap_goods_voucher_q = (
+        select(func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0))
+        .where(VoucherEntry.company_name == company_name)
+        .where(VoucherEntry.is_debit == True)
+        .where(VoucherEntry.ledger_name.in_(
+            select(Ledger.name)
+            .where(Ledger.company_name == company_name)
+            .where(Ledger.parent.in_(tax_input_parents))
+        ))
+        .where(VoucherEntry.voucher_guid.in_(
+            select(VoucherEntry.voucher_guid)
+            .where(VoucherEntry.company_name == company_name)
+            .where(VoucherEntry.ledger_name.in_(
+                select(Ledger.name)
+                .where(Ledger.company_name == company_name)
+                .where(Ledger.parent.in_(capital_parents))
+            ))
+        ))
+    )
+    if date_from:
+        cap_goods_voucher_q = cap_goods_voucher_q.where(VoucherEntry.voucher_date >= date_from)
+    if date_to:
+        cap_goods_voucher_q = cap_goods_voucher_q.where(VoucherEntry.voucher_date <= date_to)
+    capital_goods_itc = float((await db.execute(cap_goods_voucher_q)).scalar() or 0)
+
+    # ── Input Services ITC (for goods export — Circular 135 exclusion) ──
+    service_parents = ['Indirect Expenses', 'Administrative Expenses',
+                       'Selling Expenses', 'Misc. Expenses (ASSET)']
+    input_services_itc = await sum_voucher_entries_by_parent(
+        tax_input_parents, is_debit=True, date_from_=date_from, date_to_=date_to
+    )
+    # Approximate by finding tax entries on vouchers that have service expense ledgers
+    svc_itc_q = (
+        select(func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0))
+        .where(VoucherEntry.company_name == company_name)
+        .where(VoucherEntry.is_debit == True)
+        .where(VoucherEntry.ledger_name.in_(
+            select(Ledger.name)
+            .where(Ledger.company_name == company_name)
+            .where(Ledger.parent.in_(tax_input_parents))
+        ))
+        .where(VoucherEntry.voucher_guid.in_(
+            select(VoucherEntry.voucher_guid)
+            .where(VoucherEntry.company_name == company_name)
+            .where(VoucherEntry.ledger_name.in_(
+                select(Ledger.name)
+                .where(Ledger.company_name == company_name)
+                .where(Ledger.parent.in_(service_parents))
+            ))
+        ))
+    )
+    if date_from:
+        svc_itc_q = svc_itc_q.where(VoucherEntry.voucher_date >= date_from)
+    if date_to:
+        svc_itc_q = svc_itc_q.where(VoucherEntry.voucher_date <= date_to)
+    input_services_itc = float((await db.execute(svc_itc_q)).scalar() or 0)
+
+    # ── Export/Zero-Rated Turnover ──
+    export_turnover, export_ledger_names = await sum_export_sales(date_from, date_to)
+
+    # ── Exempt Turnover ──
+    exempt_keywords = ['exempt', 'nil rated', 'nil-rated', 'non-taxable']
+    exempt_conditions = [Ledger.name.ilike(f"%{kw}%") for kw in exempt_keywords]
+    exempt_ledger_q = (
+        select(Ledger.name)
+        .where(Ledger.company_name == company_name)
+        .where(Ledger.parent.in_(['Sales Accounts', 'Sales Account']))
+        .where(or_(*exempt_conditions))
+    )
+    exempt_ledgers = [row[0] for row in await db.execute(exempt_ledger_q)]
+    exempt_turnover = 0.0
+    if exempt_ledgers:
+        ex_q = (
+            select(func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0))
+            .where(VoucherEntry.company_name == company_name)
+            .where(VoucherEntry.ledger_name.in_(exempt_ledgers))
+            .where(VoucherEntry.is_debit == False)
+        )
+        if date_from:
+            ex_q = ex_q.where(VoucherEntry.voucher_date >= date_from)
+        if date_to:
+            ex_q = ex_q.where(VoucherEntry.voucher_date <= date_to)
+        exempt_turnover = float((await db.execute(ex_q)).scalar() or 0)
+
+    # ── Output Tax (for IDS) ──
+    output_tax = await sum_voucher_entries_by_parent(
+        tax_input_parents, is_debit=False, date_from_=date_from, date_to_=date_to
+    )
+
+    # ── Voucher counts for metadata ──
+    sales_count_q = (
+        select(func.count(Voucher.id))
+        .where(Voucher.company_name == company_name, Voucher.voucher_type == "Sales")
+    )
+    purchase_count_q = (
+        select(func.count(Voucher.id))
+        .where(Voucher.company_name == company_name, Voucher.voucher_type == "Purchase")
+    )
+    if date_from:
+        sales_count_q = sales_count_q.where(Voucher.date >= date_from)
+        purchase_count_q = purchase_count_q.where(Voucher.date >= date_from)
+    if date_to:
+        sales_count_q = sales_count_q.where(Voucher.date <= date_to)
+        purchase_count_q = purchase_count_q.where(Voucher.date <= date_to)
+
+    sales_count = (await db.execute(sales_count_q)).scalar() or 0
+    purchase_count = (await db.execute(purchase_count_q)).scalar() or 0
+
+    # ══════════════════════════════════════════════════════════
+    # BUILD RESPONSE PER REFUND TYPE
+    # ══════════════════════════════════════════════════════════
+
+    if refund_type in ("export_goods_lut", "export_service_lut", "deemed_export"):
+        if refund_type == "export_goods_lut":
+            fields = {
+                "turnover_zero_rated_goods": round(export_turnover, 2),
+                "total_turnover": round(total_sales - export_turnover, 2),
+                "exempt_turnover": round(exempt_turnover, 2),
+                "itc_availed": round(itc_total, 2),
+                "itc_capital_goods": round(capital_goods_itc, 2),
+                "blocked_credit": 0,
+                "itc_input_services": round(input_services_itc, 2),
+            }
+        elif refund_type == "export_service_lut":
+            fields = {
+                "turnover_zero_rated_services": round(export_turnover, 2),
+                "total_turnover": round(total_sales - export_turnover, 2),
+                "exempt_turnover": round(exempt_turnover, 2),
+                "itc_availed": round(itc_total, 2),
+                "itc_capital_goods": round(capital_goods_itc, 2),
+                "blocked_credit": 0,
+            }
+        else:  # deemed_export
+            fields = {
+                "turnover_zero_rated_goods": round(export_turnover, 2),
+                "total_turnover": round(total_sales - export_turnover, 2),
+                "exempt_turnover": round(exempt_turnover, 2),
+                "itc_availed": round(itc_total, 2),
+                "itc_capital_goods": round(capital_goods_itc, 2),
+                "blocked_credit": 0,
+            }
+
+        if export_ledger_names:
+            notes.append(f"Export turnover from ledgers: {', '.join(export_ledger_names)}")
+        else:
+            notes.append(
+                "No export-specific ledgers found. "
+                "Please enter zero-rated turnover manually or rename Tally ledgers "
+                "to include 'Export' / 'Zero Rated' / 'SEZ' in the name."
+            )
+
+    elif refund_type == "inverted_duty":
+        fields = {
+            "turnover_inverted": 0,
+            "total_turnover": round(total_sales, 2),
+            "exempt_turnover": round(exempt_turnover, 2),
+            "itc_availed": round(itc_total, 2),
+            "itc_capital_goods": round(capital_goods_itc, 2),
+            "blocked_credit": 0,
+            "tax_payable_inverted": round(output_tax, 2),
+        }
+        notes.append(
+            "Inverted rated supply turnover must be entered manually — "
+            "identify outputs where input GST rate exceeds output rate."
+        )
+
+    elif refund_type == "export_igst":
+        # IGST paid: approximate from tax entries on sales vouchers
+        igst_on_sales_q = (
+            select(func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0))
+            .where(VoucherEntry.company_name == company_name)
+            .where(VoucherEntry.is_debit == False)
+            .where(VoucherEntry.ledger_name.ilike("%igst%"))
+            .where(VoucherEntry.voucher_guid.in_(
+                select(Voucher.guid)
+                .where(Voucher.company_name == company_name)
+                .where(Voucher.voucher_type == "Sales")
+            ))
+        )
+        if date_from:
+            igst_on_sales_q = igst_on_sales_q.where(VoucherEntry.voucher_date >= date_from)
+        if date_to:
+            igst_on_sales_q = igst_on_sales_q.where(VoucherEntry.voucher_date <= date_to)
+        igst_on_exports = float((await db.execute(igst_on_sales_q)).scalar() or 0)
+
+        fields = {
+            "igst_paid_on_exports": round(igst_on_exports, 2),
+            "igst_paid_on_services": 0,
+            "shipping_bills_total": 0,
+            "shipping_bills_matched": 0,
+            "withheld_amount": 0,
+        }
+        notes.append("Shipping bill data not available in Tally — enter manually.")
+
+    elif refund_type == "excess_cash":
+        fields = {
+            "cash_ledger_balance": 0,
+            "amount_earmarked": 0,
+            "refund_amount": 0,
+        }
+        notes.append("Electronic Cash Ledger balance must be fetched from GST Portal.")
+
+    else:
+        return {"error": f"Unknown refund type: {refund_type}"}
+
+    # ── Add blocked credit note ──
+    notes.append(
+        "Blocked credit u/s 17(5) requires professional judgment — "
+        "review personal expenses, club membership, motor vehicles, etc."
+    )
+
+    return {
+        "refund_type": refund_type,
+        "company_name": company_name,
+        "date_from": date_from,
+        "date_to": date_to,
+        "fields": fields,
+        "notes": notes,
+        "metadata": {
+            "total_sales": round(total_sales, 2),
+            "total_purchases": round(total_purchases, 2),
+            "sales_voucher_count": sales_count,
+            "purchase_voucher_count": purchase_count,
+            "export_turnover_detected": round(export_turnover, 2),
+            "export_ledgers_matched": export_ledger_names,
+            "exempt_ledgers_matched": exempt_ledgers,
+            "itc_total": round(itc_total, 2),
+            "capital_goods_itc": round(capital_goods_itc, 2),
+            "input_services_itc": round(input_services_itc, 2),
+            "output_tax": round(output_tax, 2),
+        },
+    }
+
+
+# ──────────────────────────────────────────
+# INVOICE-LEVEL DATA FOR RECONCILIATION
+# ──────────────────────────────────────────
+@router.get("/invoices")
+async def list_invoices_for_recon(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+    company_name: str = Query(...),
+    voucher_type: str = Query("Sales", description="Sales or Purchase"),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(500, ge=1, le=2000),
+) -> Any:
+    """Return invoice-level data from Tally vouchers for reconciliation.
+    Joins with Ledger to get party GSTIN.
+    Returns: party_name, gstin, voucher_number, date, amount, tax_entries."""
+
+    # ── Base query: vouchers with party GSTIN from ledger ──
+    q = (
+        select(
+            Voucher.voucher_number,
+            Voucher.date,
+            Voucher.party_name,
+            Voucher.amount,
+            Voucher.narration,
+            Voucher.guid,
+            Ledger.party_gstin,
+            Ledger.state,
+        )
+        .outerjoin(
+            Ledger,
+            and_(
+                Ledger.company_name == Voucher.company_name,
+                Ledger.name == Voucher.party_name,
+            ),
+        )
+        .where(Voucher.company_name == company_name)
+        .where(Voucher.voucher_type == voucher_type)
+    )
+
+    if date_from:
+        q = q.where(Voucher.date >= date_from)
+    if date_to:
+        q = q.where(Voucher.date <= date_to)
+
+    q = q.order_by(Voucher.date.desc())
+
+    # Count total
+    count_q = (
+        select(func.count(Voucher.id))
+        .where(Voucher.company_name == company_name)
+        .where(Voucher.voucher_type == voucher_type)
+    )
+    if date_from:
+        count_q = count_q.where(Voucher.date >= date_from)
+    if date_to:
+        count_q = count_q.where(Voucher.date <= date_to)
+    total = (await db.execute(count_q)).scalar() or 0
+
+    # Paginate
+    offset = (page - 1) * per_page
+    q = q.offset(offset).limit(per_page)
+
+    rows = (await db.execute(q)).all()
+
+    # ── Get tax entries for each voucher ──
+    voucher_guids = [r[5] for r in rows]  # guid column
+
+    tax_entries_map = {}
+    if voucher_guids:
+        # Get all tax ledger entries (Duties & Taxes parent) for these vouchers
+        tax_ledgers_q = (
+            select(Ledger.name)
+            .where(Ledger.company_name == company_name)
+            .where(Ledger.parent.in_([
+                "Duties & Taxes", "Duties and Taxes",
+                "Current Liabilities", "Tax",
+            ]))
+        )
+        tax_ledger_names = [r[0] for r in await db.execute(tax_ledgers_q)]
+
+        if tax_ledger_names:
+            tax_q = (
+                select(
+                    VoucherEntry.voucher_guid,
+                    VoucherEntry.ledger_name,
+                    VoucherEntry.amount,
+                    VoucherEntry.is_debit,
+                )
+                .where(VoucherEntry.company_name == company_name)
+                .where(VoucherEntry.voucher_guid.in_(voucher_guids))
+                .where(VoucherEntry.ledger_name.in_(tax_ledger_names))
+            )
+            tax_rows = (await db.execute(tax_q)).all()
+            for tr in tax_rows:
+                guid = tr[0]
+                if guid not in tax_entries_map:
+                    tax_entries_map[guid] = []
+                tax_entries_map[guid].append({
+                    "ledger": tr[1],
+                    "amount": abs(float(tr[2])) if tr[2] else 0,
+                    "type": "debit" if tr[3] else "credit",
+                })
+
+    # ── Build response ──
+    invoices = []
+    for row in rows:
+        inv_no, date, party, amount, narration, guid, gstin, state = row
+        tax_entries = tax_entries_map.get(guid, [])
+        total_tax = sum(t["amount"] for t in tax_entries)
+
+        # Determine tax breakup (CGST/SGST/IGST)
+        cgst = sum(t["amount"] for t in tax_entries if "cgst" in (t["ledger"] or "").lower())
+        sgst = sum(t["amount"] for t in tax_entries if "sgst" in (t["ledger"] or "").lower())
+        igst = sum(t["amount"] for t in tax_entries if "igst" in (t["ledger"] or "").lower())
+        cess = sum(t["amount"] for t in tax_entries if "cess" in (t["ledger"] or "").lower())
+
+        taxable_value = abs(float(amount)) - total_tax if amount else 0
+
+        invoices.append({
+            "invoice_no": inv_no or "",
+            "date": date or "",
+            "party_name": party or "",
+            "gstin": gstin or "",
+            "state": state or "",
+            "total_amount": abs(float(amount)) if amount else 0,
+            "taxable_value": round(taxable_value, 2),
+            "cgst": round(cgst, 2),
+            "sgst": round(sgst, 2),
+            "igst": round(igst, 2),
+            "cess": round(cess, 2),
+            "total_tax": round(total_tax, 2),
+            "narration": narration or "",
+        })
+
+    # ── Summary ──
+    total_amount = sum(i["total_amount"] for i in invoices)
+    total_taxable = sum(i["taxable_value"] for i in invoices)
+    total_tax_sum = sum(i["total_tax"] for i in invoices)
+
+    return {
+        "company_name": company_name,
+        "voucher_type": voucher_type,
+        "date_from": date_from,
+        "date_to": date_to,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "summary": {
+            "invoice_count": len(invoices),
+            "total_amount": round(total_amount, 2),
+            "total_taxable": round(total_taxable, 2),
+            "total_tax": round(total_tax_sum, 2),
+        },
+        "invoices": invoices,
+    }
+
+
+# ──────────────────────────────────────────
+# REPORTS — MONTHLY SUMMARY
+# ──────────────────────────────────────────
+@router.get("/reports/monthly-summary")
+async def monthly_summary_report(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+    company_name: str = Query(...),
+    year: Optional[int] = None,
+) -> Any:
+    """Return month-wise aggregation of sales, purchases, and tax from Tally.
+    Used to power the Reports tab with real book data."""
+
+    # Determine financial year range
+    if not year:
+        from datetime import datetime
+        now = datetime.now()
+        year = now.year if now.month >= 4 else now.year - 1
+
+    fy_start = f"{year}0401"
+    fy_end = f"{year + 1}0331"
+
+    # ── Monthly Sales ──
+    sales_q = (
+        select(
+            func.substr(Voucher.date, 1, 6).label("month"),
+            func.count(Voucher.id).label("count"),
+            func.coalesce(func.sum(func.abs(Voucher.amount)), 0).label("total"),
+        )
+        .where(Voucher.company_name == company_name)
+        .where(Voucher.voucher_type == "Sales")
+        .where(Voucher.date >= fy_start)
+        .where(Voucher.date <= fy_end)
+        .group_by(func.substr(Voucher.date, 1, 6))
+        .order_by(func.substr(Voucher.date, 1, 6))
+    )
+    sales_rows = (await db.execute(sales_q)).all()
+
+    # ── Monthly Purchases ──
+    purchase_q = (
+        select(
+            func.substr(Voucher.date, 1, 6).label("month"),
+            func.count(Voucher.id).label("count"),
+            func.coalesce(func.sum(func.abs(Voucher.amount)), 0).label("total"),
+        )
+        .where(Voucher.company_name == company_name)
+        .where(Voucher.voucher_type == "Purchase")
+        .where(Voucher.date >= fy_start)
+        .where(Voucher.date <= fy_end)
+        .group_by(func.substr(Voucher.date, 1, 6))
+        .order_by(func.substr(Voucher.date, 1, 6))
+    )
+    purchase_rows = (await db.execute(purchase_q)).all()
+
+    # ── Monthly Tax (from Duties & Taxes ledger entries) ──
+    tax_ledgers_q = (
+        select(Ledger.name)
+        .where(Ledger.company_name == company_name)
+        .where(Ledger.parent.in_([
+            "Duties & Taxes", "Duties and Taxes",
+            "Current Liabilities", "Tax",
+        ]))
+    )
+    tax_ledger_names = [r[0] for r in await db.execute(tax_ledgers_q)]
+
+    tax_month_data = {}
+    if tax_ledger_names:
+        tax_q = (
+            select(
+                func.substr(VoucherEntry.voucher_date, 1, 6).label("month"),
+                VoucherEntry.ledger_name,
+                func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0).label("total"),
+            )
+            .where(VoucherEntry.company_name == company_name)
+            .where(VoucherEntry.ledger_name.in_(tax_ledger_names))
+            .where(VoucherEntry.voucher_date >= fy_start)
+            .where(VoucherEntry.voucher_date <= fy_end)
+            .group_by(
+                func.substr(VoucherEntry.voucher_date, 1, 6),
+                VoucherEntry.ledger_name,
+            )
+            .order_by(func.substr(VoucherEntry.voucher_date, 1, 6))
+        )
+        tax_rows = (await db.execute(tax_q)).all()
+        for row in tax_rows:
+            month = row[0]
+            ledger = (row[1] or "").lower()
+            amt = float(row[2]) if row[2] else 0
+            if month not in tax_month_data:
+                tax_month_data[month] = {"cgst": 0, "sgst": 0, "igst": 0, "cess": 0, "other": 0}
+            if "cgst" in ledger:
+                tax_month_data[month]["cgst"] += amt
+            elif "sgst" in ledger or "utgst" in ledger:
+                tax_month_data[month]["sgst"] += amt
+            elif "igst" in ledger:
+                tax_month_data[month]["igst"] += amt
+            elif "cess" in ledger:
+                tax_month_data[month]["cess"] += amt
+            else:
+                tax_month_data[month]["other"] += amt
+
+    # ── Export sales detection ──
+    export_conditions = [
+        Ledger.name.ilike("%export%"),
+        Ledger.name.ilike("%zero rated%"),
+        Ledger.name.ilike("%lut%"),
+        Ledger.name.ilike("%foreign%"),
+    ]
+    export_ledger_q = (
+        select(Ledger.name)
+        .where(Ledger.company_name == company_name)
+        .where(or_(*export_conditions))
+    )
+    export_ledger_names = [r[0] for r in await db.execute(export_ledger_q)]
+
+    export_month_data = {}
+    if export_ledger_names:
+        exp_q = (
+            select(
+                func.substr(VoucherEntry.voucher_date, 1, 6).label("month"),
+                func.coalesce(func.sum(func.abs(VoucherEntry.amount)), 0).label("total"),
+            )
+            .where(VoucherEntry.company_name == company_name)
+            .where(VoucherEntry.ledger_name.in_(export_ledger_names))
+            .where(VoucherEntry.is_debit == False)
+            .where(VoucherEntry.voucher_date >= fy_start)
+            .where(VoucherEntry.voucher_date <= fy_end)
+            .group_by(func.substr(VoucherEntry.voucher_date, 1, 6))
+            .order_by(func.substr(VoucherEntry.voucher_date, 1, 6))
+        )
+        exp_rows = (await db.execute(exp_q)).all()
+        for row in exp_rows:
+            export_month_data[row[0]] = float(row[1]) if row[1] else 0
+
+    # ── Build monthly summary ──
+    all_months = set()
+    for r in sales_rows:
+        all_months.add(r[0])
+    for r in purchase_rows:
+        all_months.add(r[0])
+    for m in tax_month_data:
+        all_months.add(m)
+
+    sales_map = {r[0]: {"count": r[1], "total": round(float(r[2]), 2)} for r in sales_rows}
+    purchase_map = {r[0]: {"count": r[1], "total": round(float(r[2]), 2)} for r in purchase_rows}
+
+    months = []
+    for m in sorted(all_months):
+        s = sales_map.get(m, {"count": 0, "total": 0})
+        p = purchase_map.get(m, {"count": 0, "total": 0})
+        t = tax_month_data.get(m, {"cgst": 0, "sgst": 0, "igst": 0, "cess": 0, "other": 0})
+        exp = export_month_data.get(m, 0)
+
+        total_tax = t["cgst"] + t["sgst"] + t["igst"] + t["cess"]
+
+        months.append({
+            "month": m,  # YYYYMM format
+            "sales": s["total"],
+            "sales_count": s["count"],
+            "purchases": p["total"],
+            "purchase_count": p["count"],
+            "export_sales": round(exp, 2),
+            "cgst": round(t["cgst"], 2),
+            "sgst": round(t["sgst"], 2),
+            "igst": round(t["igst"], 2),
+            "cess": round(t["cess"], 2),
+            "total_tax": round(total_tax, 2),
+        })
+
+    # ── FY totals ──
+    total_sales = sum(m["sales"] for m in months)
+    total_purchases = sum(m["purchases"] for m in months)
+    total_exports = sum(m["export_sales"] for m in months)
+    total_cgst = sum(m["cgst"] for m in months)
+    total_sgst = sum(m["sgst"] for m in months)
+    total_igst = sum(m["igst"] for m in months)
+    total_tax = sum(m["total_tax"] for m in months)
+
+    return {
+        "company_name": company_name,
+        "financial_year": f"{year}-{year + 1}",
+        "fy_start": fy_start,
+        "fy_end": fy_end,
+        "months": months,
+        "totals": {
+            "sales": round(total_sales, 2),
+            "purchases": round(total_purchases, 2),
+            "export_sales": round(total_exports, 2),
+            "cgst": round(total_cgst, 2),
+            "sgst": round(total_sgst, 2),
+            "igst": round(total_igst, 2),
+            "total_tax": round(total_tax, 2),
+        },
+        "export_ledgers": export_ledger_names,
+        "tax_ledgers": tax_ledger_names[:10],  # Sample for reference
+    }
