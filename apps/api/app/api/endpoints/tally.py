@@ -26,7 +26,7 @@ async def list_ledgers(
     search: Optional[str] = None,
     parent: Optional[str] = None,
     page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
+    per_page: int = Query(50, ge=1, le=1000),
 ) -> Any:
     """List ledgers with search/filter/pagination."""
     q = select(Ledger)
