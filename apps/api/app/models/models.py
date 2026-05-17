@@ -609,6 +609,38 @@ class FinancialInstrumentUpload(Base):
     )
 
 
+class FIEntry(Base):
+    """Stores individual journal entries generated from Financial Instrument uploads.
+    Links to the upload and the client."""
+    __tablename__ = "fi_entries"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    upload_id = Column(UUID(as_uuid=True), ForeignKey("fi_uploads.id", ondelete="CASCADE"), nullable=False, index=True)
+    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    date = Column(sa.Date, nullable=True)
+    narration = Column(Text, nullable=True)
+    scrip = Column(String(255), nullable=True)
+    trade_count = Column(Integer, default=0)
+    cg_type = Column(String(20), nullable=True)
+    voucher_type = Column(String(50), default="Journal")
+    status = Column(String(20), default="draft")
+    total_amount = Column(sa.Numeric(15, 2), nullable=True)
+    
+    entries = Column(JSONB, nullable=True, default=[]) 
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    upload = relationship("FinancialInstrumentUpload")
+    
+    __table_args__ = (
+        Index('idx_fi_entry_upload', 'upload_id'),
+        Index('idx_fi_entry_client', 'client_id'),
+        Index('idx_fi_entry_date', 'client_id', 'date'),
+    )
+
+
 # ═══════════════════════════════════════════════════════
 # PMS Accounting — FIFO Lot Tracking & Capital Gains
 # ═══════════════════════════════════════════════════════

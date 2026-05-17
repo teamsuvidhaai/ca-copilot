@@ -275,6 +275,10 @@ async def classify_company_fi(db, company_name: str, date_from: str = None, date
         except ValueError:
             pass
 
+    # Get last sync status
+    sync_query = select(func.max(Ledger.synced_at)).where(Ledger.company_name == company_name)
+    last_sync = (await db.execute(sync_query)).scalar()
+
     ledger_query = (
         select(Ledger)
         .where(Ledger.company_name == company_name)
@@ -552,6 +556,7 @@ async def classify_company_fi(db, company_name: str, date_from: str = None, date
     return {
         "has_data": True,
         "company_name": company_name,
+        "last_sync": last_sync.isoformat() if last_sync else None,
         "total_ledgers": len(ledgers),
         "total_vouchers": len(vouchers),
         "fi_ledger_count": len(fi_ledgers),

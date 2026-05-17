@@ -425,7 +425,7 @@ def _upload_to_supabase(file_bytes: bytes, upload_id: str, filename: str) -> str
 # Uses FinancialInstrumentUpload model — survives restarts, supports queries
 
 from app.db.session import AsyncSessionLocal
-from app.models.models import FinancialInstrumentUpload
+from app.models.models import FinancialInstrumentUpload, FIEntry
 import hashlib
 
 
@@ -457,6 +457,24 @@ async def _process_upload(upload_id: str, file_bytes: bytes, filename: str, inst
 
                 row.journal_entries = entries
                 row.journal_entry_count = len(entries)
+                
+                # Save to fi_entries table
+                for je in entries:
+                    fi_entry = FIEntry(
+                        upload_id=upload_id,
+                        client_id=row.client_id,
+                        date=datetime.strptime(je.get("date"), "%Y-%m-%d").date() if je.get("date") else None,
+                        narration=je.get("narration"),
+                        scrip=je.get("scrip"),
+                        trade_count=je.get("tradeCount", 0),
+                        cg_type=je.get("cgType"),
+                        voucher_type=je.get("voucher_type", "Journal"),
+                        status=je.get("status", "draft"),
+                        total_amount=je.get("total_amount"),
+                        entries=je.get("entries", je.get("ledger_entries", []))
+                    )
+                    db.add(fi_entry)
+
                 row.status = "completed"
                 await db.commit()
 
@@ -481,6 +499,24 @@ async def _process_upload(upload_id: str, file_bytes: bytes, filename: str, inst
 
                 row.journal_entries = entries
                 row.journal_entry_count = len(entries)
+                
+                # Save to fi_entries table
+                for je in entries:
+                    fi_entry = FIEntry(
+                        upload_id=upload_id,
+                        client_id=row.client_id,
+                        date=datetime.strptime(je.get("date"), "%Y-%m-%d").date() if je.get("date") else None,
+                        narration=je.get("narration"),
+                        scrip=je.get("scrip"),
+                        trade_count=je.get("tradeCount", 0),
+                        cg_type=je.get("cgType"),
+                        voucher_type=je.get("voucher_type", "Journal"),
+                        status=je.get("status", "draft"),
+                        total_amount=je.get("total_amount"),
+                        entries=je.get("entries", je.get("ledger_entries", []))
+                    )
+                    db.add(fi_entry)
+
                 row.status = "completed"
                 await db.commit()
 
@@ -626,7 +662,29 @@ async def get_journal_entries(
     if row.status != "completed":
         raise HTTPException(400, f"Entries not ready. Status: {row.status}")
 
-    # Return stored entries if available
+    # Try fetching from the new fi_entries table first
+    stmt = select(FIEntry).where(FIEntry.upload_id == upload_id)
+    result = await db.execute(stmt)
+    db_entries = result.scalars().all()
+    
+    if db_entries:
+        entries = []
+        for e in db_entries:
+            entries.append({
+                "id": str(e.id),
+                "date": e.date.isoformat() if e.date else None,
+                "narration": e.narration,
+                "scrip": e.scrip,
+                "tradeCount": e.trade_count,
+                "cgType": e.cg_type,
+                "voucher_type": e.voucher_type,
+                "status": e.status,
+                "total_amount": float(e.total_amount) if e.total_amount else 0,
+                "entries": e.entries
+            })
+        return {"journal_entries": entries}
+
+    # Return stored entries from JSONB column if available
     if row.journal_entries:
         return {"journal_entries": row.journal_entries}
 
@@ -787,6 +845,34 @@ async def update_je_status(
     await db.commit()
     logger.info(f"Upload {upload_id} je_status -> {payload.je_status}")
     return {"id": upload_id, "je_status": payload.je_status, "message": f"Journal entries marked as {payload.je_status}"}
+
+
+class EntryStatusUpdate(BaseModel):
+    status: str  # draft, approved, synced
+
+
+@router.patch("/journal-entry/{entry_id}/status")
+async def update_entry_status(
+    entry_id: str,
+    payload: EntryStatusUpdate,
+    current_user: User = Depends(deps.get_current_user),
+    db: AsyncSession = Depends(deps.get_db),
+) -> Any:
+    """Update the status of a single journal entry in fi_entries."""
+    if payload.status not in ("draft", "approved", "synced"):
+        raise HTTPException(400, "status must be draft, approved, or synced")
+
+    row = (await db.execute(
+        select(FIEntry).where(FIEntry.id == entry_id)
+    )).scalar_one_or_none()
+    
+    if not row:
+        raise HTTPException(404, "Entry not found")
+
+    row.status = payload.status
+    await db.commit()
+    logger.info(f"FIEntry {entry_id} status -> {payload.status}")
+    return {"id": entry_id, "status": payload.status, "message": f"Entry marked as {payload.status}"}
 
 
 # ═══════════════════════════════════════════════════════
